@@ -1,0 +1,4 @@
+pyvista #==0.46.5
+vtk<9.6.0
+networkx
+numpy
