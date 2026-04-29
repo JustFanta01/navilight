@@ -1,70 +1,93 @@
 """
 ============================================================
-SMART BUILDING NAVIGATION SIMULATION
+SMART BUILDING NAVIGATION SIMULATION — STRATEGY REFACTOR
 ============================================================
 
-This simulation models evacuation routing in a building using:
+This simulation models evacuation routing in a building using three
+separate layers:
 
-1. MOVEMENT GRAPH (networkx.Graph)
-   - Nodes = physical positions (rooms, junctions, stairs)
-   - Edges = walkable paths
-   - Used for computing distances and valid paths
+1. MOVEMENT GRAPH  G_M = (V, A)
+   - Nodes = physical positions: rooms, junctions, stairs, exits
+   - Edges = walkable paths with traversal costs
+   - Defines the physical walkability of the building
 
-2. COMMUNICATION GRAPH (networkx.Graph)
-   - Nodes = sensors (cameras, controllers)
-   - Edges = wireless communication links (range-based)
-   - Used for distributed information exchange
+2. COMMUNICATION GRAPH  G_C = (S, L)
+   - Nodes = sensors/controllers
+   - Edges = communication links between nearby devices
+   - Defines how routing information can be exchanged
 
-3. SENSORS
-   - Each sensor observes ZERO, ONE, or MULTIPLE movement nodes
-   - Sensors can:
-        - observe local state (if node in range)
-        - relay information (even if observing nothing)
-
-------------------------------------------------------------
-
-ROUTING MODES
-------------------------------------------------------------
-
-CENTRALIZED:
-    - Classic diffusion (Bellman-Ford) on movement graph
-    - Gives exact shortest paths
-    - Sensors simply "read" global solution
-
-DISTRIBUTED:
-    - Each sensor maintains local estimates of node values
-    - Sensors exchange information via communication graph
-    - Only observed nodes are updated locally
-    - Converges to global solution (if graph connected)
+3. ROUTING STRATEGIES
+   - A RoutingStrategy exposes the same interface regardless of algorithm
+   - The viewer only talks to StrategyManager.current()
+   - New algorithms, such as D* Lite, can be registered without changing
+     the viewer
 
 ------------------------------------------------------------
 
-VISUALIZATION
+CURRENT STRATEGIES
 ------------------------------------------------------------
 
-- Black nodes: movement graph
-- Blue arrows: global routing policy (centralized)
-- Orange arrows: sensor decisions
-    - centralized mode: read global solution
-    - distributed mode: computed locally
+CENTRALIZED DIFFUSION:
+    - Synchronous Bellman value diffusion on the movement graph
+    - Has full knowledge of G_M
+    - Produces a global value field V(x) and policy pi(x)
 
-- Heatmap:
-    - node values (distance-to-exit)
+DISTRIBUTED DIFFUSION:
+    - Each sensor keeps local estimates V_s(x)
+    - Sensors update observed movement nodes locally
+    - Sensors exchange estimates through G_C
+    - Produces a distributed approximation of the global value field
 
 ------------------------------------------------------------
 
-KEY IDEA
+MATHEMATICAL IDEA
 ------------------------------------------------------------
 
-Movement graph = "physics"
-Communication graph = "information flow"
-Sensors = "distributed decision makers"
+The desired value field is the shortest distance to the nearest exit:
+
+$$
+V(x) = \min_{e \in E} d(x,e)
+$$
+
+The Bellman fixed point is:
+
+$$
+V(x)=
+\begin{cases}
+0, & x \in E \\
+\min\limits_{y \in \mathcal{N}(x)}
+\left(c(x,y)+V(y)\right), & x \notin E
+\end{cases}
+$$
+
+The induced routing policy is:
+
+$$
+\pi(x)=
+\arg\min_{y \in \mathcal{N}(x)}
+\left(c(x,y)+V(y)\right)
+$$
+
+------------------------------------------------------------
+
+KEY ARCHITECTURAL IDEA
+------------------------------------------------------------
+
+Movement graph      = physics
+Communication graph = information flow
+Routing strategy    = algorithm
+Viewer              = visualization and interaction only
+
+The viewer is algorithm-agnostic.
+It does not know whether the current algorithm is centralized,
+distributed, D* Lite, or something else.
 
 ============================================================
 """
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -75,6 +98,7 @@ try:
     import pyvista as pv
 except ImportError as e:
     raise SystemExit("Install with: pip install pyvista networkx numpy") from e
+
 
 Vec3 = Tuple[float, float, float]
 
@@ -93,6 +117,7 @@ class Space:
     opacity: float = 0.3
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+
 @dataclass
 class Sensor:
     name: str
@@ -108,10 +133,30 @@ class Sensor:
 
 class BuildingGeometry:
     """
-    Owns the physical/semantic model:
-    - spaces: rooms, corridors, floors, stairs
-    - movement_graph: where people can move
-    - sensors: communication devices independent from movement nodes
+    Owns the physical/semantic building model.
+
+    This class does not know any routing algorithm.
+
+    It owns:
+    - spaces: visualization volumes such as rooms/corridors/stairs
+    - movement_graph: physical walkability graph
+    - sensors: devices that observe nodes and communicate externally
+
+    Sensor coverage is same-floor by default:
+
+    $$
+    O_s = \{x \in V : \|p_s - p_x\| \le r_s
+    \text{ and } level(s)=level(x)\}
+    $$
+
+    Each sensor also gets an anchor node:
+
+    $$
+    a_s = \arg\min_{x : level(x)=level(s)} \|p_s-p_x\|
+    $$
+
+    Sensor arrows are drawn from the sensor position toward the routing
+    policy of its anchor node, not toward an arbitrary observed node.
     """
 
     def __init__(self) -> None:
@@ -186,11 +231,34 @@ class BuildingGeometry:
 
     def compute_sensor_coverage(self, radius_scale: float = 1.0) -> None:
         """
-        Assign observed_nodes automatically.
+        Compute observed nodes and anchor node for every sensor.
 
-        Also assigns one anchor_node per sensor:
-        - nearest movement node on the same floor
-        - arrows are based on this anchor_node, not on arbitrary best observed node
+        Observed nodes:
+
+        $$
+        O_s =
+        \{x \in V :
+        \|p_s-p_x\| \le r_s \cdot \alpha
+        \land level(s)=level(x)\}
+        $$
+
+        Anchor node:
+
+        $$
+        a_s =
+        \arg\min_{x : level(x)=level(s)}
+        \|p_s-p_x\|
+        $$
+
+        The anchor is used for drawing sensor arrows:
+
+        $$
+        \text{sensor arrow}(s) \sim \pi(a_s)
+        $$
+
+        This avoids visually unstable behavior where a sensor arrow points
+        toward the globally best observed node instead of the place where
+        the sensor is physically installed.
         """
         for s in self.sensors.values():
             s.observed_nodes.clear()
@@ -221,14 +289,26 @@ class BuildingGeometry:
             s.metadata["anchor_dist"] = best_anchor_dist
 
     @classmethod
-    def demo_building(cls, num_floors: int = 3) -> "BuildingGeometry":
+    def demo_building(cls, num_floors: int = 2) -> "BuildingGeometry":
+        """
+        Build a parameterized multi-floor demo building.
+
+        Change only num_floors to scale the example:
+
+        - num_floors=1 tests purely horizontal routing
+        - num_floors=2 tests vertical stairs
+        - larger values test multi-floor propagation
+        """
+        if num_floors < 1:
+            raise ValueError("num_floors must be >= 1")
+
         b = cls()
 
         floor_height = 6.0
         base_z = 1.5
         zs = [base_z + i * floor_height for i in range(num_floors)]
 
-        floor_size = (44, 32, 0.3)
+        floor_size = (44, 36, 0.3)
 
         for level, z in enumerate(zs):
             b.add_space(
@@ -272,11 +352,11 @@ class BuildingGeometry:
             )
 
             rooms = [
-                ("A", ( -11,   5, z)),
-                ("B", (  11,   5, z)),
-                ("C", (   0,  15, z)),
-                ("D", (  11,  -5, z)),
-                ("E", ( -11,  -5, z)),
+                ("A", (-11, 5, z)),
+                ("B", (11, 5, z)),
+                ("C", (0, 15, z)),
+                ("D", (11, -5, z)),
+                ("E", (-11, -5, z)),
             ]
 
             for suffix, pos in rooms:
@@ -290,7 +370,7 @@ class BuildingGeometry:
                     opacity=0.35,
                     level=level,
                 )
-            
+
             b.add_space(
                 f"Lab_{level}",
                 "lab",
@@ -300,7 +380,6 @@ class BuildingGeometry:
                 opacity=0.35,
                 level=level,
             )
-
 
             b.add_space(
                 f"EastStairVol_{level}",
@@ -326,7 +405,6 @@ class BuildingGeometry:
         for level, z in enumerate(zs):
             letters = [chr(ord("A") + level * 5 + i) for i in range(5)]
 
-            # center of rooms
             b.add_movement_node(f"R_{letters[0]}", "room", (-11, 5, z), label=f"Room {letters[0]}", level=level)
             b.add_movement_node(f"R_{letters[1]}", "room", (-11, -5, z), label=f"Room {letters[1]}", level=level)
             b.add_movement_node(f"R_{letters[2]}", "room", (0, 15, z), label=f"Room {letters[2]}", level=level)
@@ -350,7 +428,7 @@ class BuildingGeometry:
                 b.add_movement_node("EXIT_E", "exit", (23, 0, z), label="East exit", level=level)
                 b.add_movement_node("EXIT_W", "exit", (-23, 0, z), label="West exit", level=level)
 
-        # In-floor alternative paths
+        # In-floor paths
         for level in range(len(zs)):
             letters = [chr(ord("A") + level * 5 + i) for i in range(5)]
 
@@ -372,7 +450,6 @@ class BuildingGeometry:
             # Alternative longer lateral path through north corridor
             b.add_movement_edge(f"J{level}_CN1", f"J{level}_N", weight=13.0)
             b.add_movement_edge(f"J{level}_CN2", f"J{level}_N", weight=13.0)
-            
             b.add_movement_edge(f"J{level}_CN1", f"R_{letters[0]}", weight=13.0)
             b.add_movement_edge(f"J{level}_CN2", f"R_{letters[4]}", weight=13.0)
 
@@ -385,11 +462,7 @@ class BuildingGeometry:
             b.add_movement_edge(f"SE{level}", f"SE{level+1}", weight=8.0)
             b.add_movement_edge(f"SW{level}", f"SW{level+1}", weight=8.0)
 
-        # optional top-floor bridge (kept behavior but generic)
-        # top = num_floors - 1
-        # b.add_movement_edge(f"SE{top}", f"SW{top}", weight=28.0)
-
-        # Sensors are NOT movement nodes.
+        # Sensors are not movement nodes.
         for level, z in enumerate(zs):
             b.add_sensor(f"CTRL_{level}_1", (-19, -2, z + 1), range_radius=15.0, level=level)
             b.add_sensor(f"SENS_W_{level}", (-11, 0, z + 1), range_radius=15.0, level=level)
@@ -398,130 +471,25 @@ class BuildingGeometry:
             b.add_sensor(f"SENS_N_{level}", (0, 10, z + 1), range_radius=15.0, level=level)
             b.add_sensor(f"SENS_L_{level}", (0, -8, z + 1), range_radius=15.0, level=level)
 
-
         b.compute_sensor_coverage()
-
         return b
 
 
 # ============================================================
-# ROUTING ENGINE
+# GRAPH UTILS
 # ============================================================
 
-class RoutingEngine:
+class MovementGraphController:
     """
-    Centralized routing engine on the movement graph.
+    Owns graph mutation operations.
 
-    The movement graph is:
-
-    $$
-    G_M = (V, A)
-    $$
-
-    where:
-
-    - $V$ is the set of movement nodes: rooms, junctions, stairs, exits
-    - $A$ is the set of walkable edges
-    - each edge $(x,y)$ has a traversal cost $c(x,y) > 0$
-
-    The goal is to compute, for every node $x$, the shortest distance to
-    the nearest exit.
-
-    Let $E \subseteq V$ be the set of exit nodes.
-
-    We define a value function:
-
-    $$
-    V(x) = \text{distance from node } x \text{ to the closest exit}
-    $$
-
-    Exit nodes are boundary conditions:
-
-    $$
-    V(x)=0 \quad \forall x \in E
-    $$
-
-    All other nodes are initialized to infinity:
-
-    $$
-    V(x)=+\infty \quad \forall x \notin E
-    $$
-
-    The diffusion update is the Bellman optimality update:
-
-    $$
-    V_{k+1}(x)=
-    \begin{cases}
-    0, & x \in E \\
-    \min\limits_{y \in \mathcal{N}(x)}
-    \left(c(x,y)+V_k(y)\right),
-    & x \notin E
-    \end{cases}
-    $$
-
-    where $\mathcal{N}(x)$ is the set of neighbors of $x$.
-
-    Blocked edges are excluded from the minimization.
-
-    The routing policy is:
-
-    $$
-    \pi(x)=
-    \arg\min\limits_{y \in \mathcal{N}(x)}
-    \left(c(x,y)+V(y)\right)
-    $$
-
-    The policy tells us which neighbor should be followed from node $x$.
-
-    In centralized mode, this algorithm has access to the full movement graph,
-    so after enough iterations it converges to the shortest-path distance field.
+    Routing strategies compute policies, but they do not own user actions
+    such as blocking/unblocking edges. This controller centralizes mutation
+    of edge state so all strategies see the same movement graph.
     """
 
     def __init__(self, movement_graph: nx.Graph) -> None:
-        # TODO: Add assumption check: reachability, connectivity of movement graph.
-        
         self.G = movement_graph
-
-    def validate_reachability(self) -> None:
-        """
-        Ensure every node can reach at least one exit.
-
-        Required condition:
-
-        $$
-        \forall x \in V, \exists \text{ path } x \to e, \quad e \in E
-        $$
-
-        If not, routing values will remain infinite.
-        """
-
-        exits = [n for n, a in self.G.nodes(data=True) if a["kind"] == "exit"]
-
-        unreachable = []
-
-        for n in self.G.nodes:
-            reachable = False
-
-            for ex in exits:
-                try:
-                    nx.shortest_path(self.G, n, ex, weight="weight")
-                    reachable = True
-                    break
-                except nx.NetworkXNoPath:
-                    continue
-
-            if not reachable:
-                unreachable.append(n)
-
-        if unreachable:
-            print("\n❌ ERROR: Unreachable nodes detected\n")
-
-            for n in unreachable:
-                print(f"  - {n}")
-
-            print("\n💡 Fix: ensure connectivity to at least one exit.\n")
-
-            raise RuntimeError("Centralized routing cannot proceed: unreachable nodes.")
 
     def set_edge_blocked(self, u: str, v: str, blocked: bool = True) -> None:
         self.G[u][v]["blocked"] = blocked
@@ -534,40 +502,166 @@ class RoutingEngine:
         for u, v in self.G.edges:
             self.set_edge_blocked(u, v, False)
 
+    def shortest_path_to_nearest_exit(self, start: str) -> Tuple[List[str], float]:
+        exits = [n for n, a in self.G.nodes(data=True) if a["kind"] == "exit"]
+
+        best_path = None
+        best_cost = float("inf")
+
+        for ex in exits:
+            try:
+                path = nx.shortest_path(self.G, start, ex, weight="weight")
+                cost = float(nx.path_weight(self.G, path, weight="weight"))
+                if cost < best_cost:
+                    best_path = path
+                    best_cost = cost
+            except nx.NetworkXNoPath:
+                pass
+
+        if best_path is None or best_cost >= 1e9:
+            raise nx.NetworkXNoPath(f"No path from {start} to any exit.")
+
+        return best_path, best_cost
+
+    def validate_reachability(self) -> None:
+        """
+        Ensure every movement node can reach at least one exit.
+
+        Required condition:
+
+        $$
+        \forall x \in V, \exists e \in E : x \leadsto e
+        $$
+
+        This check is structural. Run it when topology/blocked edges change,
+        not at every path query.
+        """
+        exits = [n for n, a in self.G.nodes(data=True) if a["kind"] == "exit"]
+        unreachable = []
+
+        for n in self.G.nodes:
+            reachable = False
+            for ex in exits:
+                try:
+                    nx.shortest_path(self.G, n, ex, weight="weight")
+                    reachable = True
+                    break
+                except nx.NetworkXNoPath:
+                    continue
+
+            if not reachable:
+                unreachable.append(n)
+
+        if unreachable:
+            print("\nERROR: Unreachable movement nodes detected:\n")
+            for n in unreachable:
+                print(f"  - {n}")
+            print("\nFix: unblock paths or add movement edges to at least one exit.\n")
+            raise RuntimeError("Movement graph contains nodes that cannot reach an exit.")
+
+
+# ============================================================
+# ROUTING STRATEGY INTERFACE
+# ============================================================
+
+class RoutingStrategy(ABC):
+    """
+    Abstract routing algorithm interface.
+
+    The viewer only depends on this abstraction.
+
+    A strategy must provide:
+    - recompute(): update internal value field/policy
+    - get_value(node): expose routing value V(node)
+    - get_next(node): expose policy pi(node), if available
+    - get_path(start): return a path under the strategy
+    - sensor_policy_arrows(): optional sensor-level arrows
+
+    A future D* Lite strategy can implement this interface without changing
+    the viewer.
+    """
+
+    def __init__(self, movement_graph: nx.Graph) -> None:
+        self.G = movement_graph
+
+    @abstractmethod
+    def recompute(self) -> None:
+        pass
+
+    @abstractmethod
+    def get_value(self, node: str) -> float:
+        pass
+
+    @abstractmethod
+    def get_next(self, node: str) -> Optional[str]:
+        pass
+
+    @abstractmethod
+    def get_path(self, start: str) -> Tuple[List[str], float]:
+        pass
+
+    def has_global_policy(self) -> bool:
+        return True
+
+    def sensor_policy_arrows(self) -> List[Tuple[np.ndarray, np.ndarray]]:
+        return []
+
+    def debug_sensor_line(self, sensor_name: str, sensor: Sensor) -> str:
+        return ""
+
+
+class CentralizedDiffusionStrategy(RoutingStrategy):
+    """
+    Centralized Bellman diffusion strategy.
+
+    Boundary condition:
+
+    $$
+    V_0(x)=
+    \begin{cases}
+    0, & x \in E \\
+    +\infty, & x \notin E
+    \end{cases}
+    $$
+
+    Synchronous Bellman update:
+
+    $$
+    V_{k+1}(x)=
+    \begin{cases}
+    0, & x \in E \\
+    \min\limits_{y \in \mathcal{N}(x)}
+    \left(c(x,y)+V_k(y)\right), & x \notin E
+    \end{cases}
+    $$
+
+    The policy is:
+
+    $$
+    \pi(x)=
+    \arg\min_{y \in \mathcal{N}(x)}
+    \left(c(x,y)+V(y)\right)
+    $$
+
+    Transient values may be wrong before convergence. Information propagates
+    approximately one graph edge per iteration.
+    """
+
+    def __init__(self, movement_graph: nx.Graph, controller: MovementGraphController, steps: int = 40) -> None:
+        super().__init__(movement_graph)
+        self.controller = controller
+        self.steps = steps
+
     def initialize_values(self) -> None:
         for _, attrs in self.G.nodes(data=True):
             attrs["value"] = 0.0 if attrs["kind"] == "exit" else float("inf")
             attrs["next"] = None
 
     def diffusion_step(self) -> None:
-        """
-        Perform one synchronous Bellman diffusion step.
-
-        For each node $x$, compute:
-
-        $$
-        V_{k+1}(x)=
-        \min_{y \in \mathcal{N}(x)}
-        \left(c(x,y)+V_k(y)\right)
-        $$
-
-        Exits remain fixed at value zero:
-
-        $$
-        V_{k+1}(x)=0 \quad \text{if } x \in E
-        $$
-
-        The update is synchronous:
-
-        - all new values are computed from the old values
-        - only after all nodes are processed, values are committed
-
-        This avoids order-dependent behavior.
-        """
         new_values = {}
         new_next = {}
 
-        for x, attrs in self.G.nodes(data=True):
+        for x, attrs in self.G.nodes(data=True): # for each movement node
             if attrs["kind"] == "exit":
                 new_values[x] = 0.0
                 new_next[x] = None
@@ -593,12 +687,21 @@ class RoutingEngine:
             self.G.nodes[n]["value"] = new_values[n]
             self.G.nodes[n]["next"] = new_next[n]
 
-    def run_diffusion(self, steps: int = 30) -> None:
+    def recompute(self) -> None:
+        # Reset is required because this min-only relaxation cannot correct
+        # old optimistic values after edge costs increase.
         self.initialize_values()
-        for _ in range(steps):
+        
+        for _ in range(self.steps):
             self.diffusion_step()
 
-    def greedy_path_from_field(self, start: str, max_hops: int = 100) -> Tuple[List[str], float]:
+    def get_value(self, node: str) -> float:
+        return float(self.G.nodes[node]["value"])
+
+    def get_next(self, node: str) -> Optional[str]:
+        return self.G.nodes[node].get("next")
+
+    def get_path(self, start: str, max_hops: int = 100) -> Tuple[List[str], float]:
         path = [start]
         visited = {start}
         current = start
@@ -608,7 +711,7 @@ class RoutingEngine:
             if self.G.nodes[current]["kind"] == "exit":
                 return path, cost
 
-            nxt = self.G.nodes[current]["next"]
+            nxt = self.get_next(current)
 
             if nxt is None:
                 raise nx.NetworkXNoPath(f"No route from {start} to any exit.")
@@ -627,35 +730,10 @@ class RoutingEngine:
 
         raise RuntimeError("Path reconstruction exceeded max_hops.")
 
-    def shortest_path_to_nearest_exit(self, start: str) -> Tuple[List[str], float]:
-        exits = [n for n, a in self.G.nodes(data=True) if a["kind"] == "exit"]
 
-        best_path = None
-        best_cost = float("inf")
-
-        for ex in exits:
-            try:
-                path = nx.shortest_path(self.G, start, ex, weight="weight")
-                cost = float(nx.path_weight(self.G, path, weight="weight"))
-
-                if cost < best_cost:
-                    best_path = path
-                    best_cost = cost
-            except nx.NetworkXNoPath:
-                pass
-
-        if best_path is None or best_cost >= 1e9:
-            raise nx.NetworkXNoPath(f"No path from {start} to any exit.")
-
-        return best_path, best_cost
-
-class DistributedRoutingEngine:
+class DistributedDiffusionEngine:
     """
-    Distributed routing engine.
-
-    In centralized routing, one algorithm sees the whole movement graph.
-    In distributed routing, each sensor stores its own local estimate of the
-    value function.
+    Internal distributed diffusion engine.
 
     Each sensor $s$ maintains:
 
@@ -663,81 +741,43 @@ class DistributedRoutingEngine:
     V_s(x)
     $$
 
-    which means:
-
-    $$
-    \text{sensor } s \text{'s estimate of the distance from node } x
-    \text{ to the closest exit}
-    $$
-
-    Sensors are connected by a communication graph:
-
-    $$
-    G_C = (S, L)
-    $$
-
-    where:
-
-    - $S$ is the set of sensors
-    - $L$ is the set of communication links
-
-    Each sensor can do two things:
-
-    1. Local physical update, only for movement nodes it observes.
-    2. Communication update, by receiving estimates from neighboring sensors.
-
-    Let $O_s \subseteq V$ be the movement nodes observed by sensor $s$.
-
-    If $x \in O_s$, sensor $s$ can apply the local Bellman update:
+    Local physical update, only if $x \in O_s$:
 
     $$
     V_s^{k+1}(x)
-    =
+    \leftarrow
     \min_{y \in \mathcal{N}(x)}
     \left(c(x,y)+V_s^k(y)\right)
     $$
 
-    Communication lets sensor $s$ receive better estimates from neighboring
-    sensors $q \in \mathcal{N}_C(s)$:
+    Communication update:
 
     $$
     V_s^{k+1}(x)
-    =
+    \leftarrow
     \min
     \left(
-        V_s^{k+1}(x),
-        \min_{q \in \mathcal{N}_C(s)} V_q^k(x)
+      V_s^{k+1}(x),
+      \min_{q \in \mathcal{N}_C(s)} V_q^k(x)
     \right)
     $$
 
-    Therefore, information about exits diffuses through the communication graph,
-    while movement feasibility is still defined by the movement graph.
+    Important assumption:
 
-    Conceptually:
+    $$
+    \bigcup_{s \in S} O_s = V
+    $$
 
-    - movement graph = physical walkability
-    - communication graph = information propagation
-    - sensor estimates = distributed approximation of the global value field
+    If a movement node is observed by no sensor, no distributed process can
+    locally update its value.
     """
-    def __init__(
-        self,
-        movement_graph: nx.Graph,
-        communication_graph: nx.Graph,
-        sensors: Dict[str, Sensor],
-    ) -> None:
-        # TODO: Add assumption check: all movement nodes are checked by at least one sensor.
-        # ~ validate_sensor_coverage
 
+    def __init__(self, movement_graph: nx.Graph, communication_graph: nx.Graph, sensors: Dict[str, Sensor]) -> None:
         self.G = movement_graph
         self.C = communication_graph
         self.sensors = sensors
-
-        # sensor -> node -> value
         self.sensor_values: Dict[str, Dict[str, float]] = {}
-
-        # sensor -> node -> next
         self.sensor_next: Dict[str, Dict[str, Optional[str]]] = {}
-
         self._initialize()
 
     def _initialize(self) -> None:
@@ -746,77 +786,41 @@ class DistributedRoutingEngine:
             self.sensor_next[s] = {}
 
             for n, attrs in self.G.nodes(data=True):
-                if attrs["kind"] == "exit":
-                    self.sensor_values[s][n] = 0.0
-                else:
-                    self.sensor_values[s][n] = float("inf")
-
+                self.sensor_values[s][n] = 0.0 if attrs["kind"] == "exit" else float("inf")
                 self.sensor_next[s][n] = None
 
+    def validate_sensor_coverage(self) -> None:
+        uncovered_nodes = []
+
+        for n in self.G.nodes:
+            if not any(n in s.observed_nodes for s in self.sensors.values()):
+                uncovered_nodes.append(n)
+
+        if uncovered_nodes:
+            print("\nERROR: Incomplete sensor coverage\n")
+            print("The following movement nodes are NOT observed by any sensor:\n")
+            for n in uncovered_nodes:
+                print(f"  - {n}")
+            print("\nFix: add sensors or increase sensor range so every node is observed.\n")
+            raise RuntimeError("Distributed routing cannot proceed: incomplete sensor coverage.")
+
     def step(self) -> None:
-        """
-        Perform one distributed routing step.
-
-        Each sensor $s$ maintains a local value estimate:
-
-        $$
-        V_s(x)
-        $$
-
-        For every movement node $x$, the sensor first keeps its current value:
-
-        $$
-        V_s^{k+1}(x) \leftarrow V_s^k(x)
-        $$
-
-        If the sensor observes $x$, it performs a local Bellman update:
-
-        $$
-        V_s^{k+1}(x)
-        \leftarrow
-        \min_{y \in \mathcal{N}(x)}
-        \left(c(x,y)+V_s^k(y)\right)
-        $$
-
-        Then it exchanges information with neighboring sensors in the communication
-        graph:
-
-        $$
-        V_s^{k+1}(x)
-        \leftarrow
-        \min
-        \left(
-            V_s^{k+1}(x),
-            \min_{q \in \mathcal{N}_C(s)} V_q^k(x)
-        \right)
-        $$
-
-        Blocked movement edges are ignored in the local Bellman update.
-
-        This is a distributed approximation of the centralized value diffusion.
-        """
         new_values = {}
         new_next = {}
 
-        for s_name, sensor in self.sensors.items():
+        for s_name, sensor in self.sensors.items():                         # for each sensor
             new_values[s_name] = {}
             new_next[s_name] = {}
 
             observed = set(sensor.observed_nodes)
 
-            for x in self.G.nodes:
+            for x in self.G.nodes:                                          # for each movement node
                 current_val = self.sensor_values[s_name][x]
                 best_val = current_val
                 best_next = self.sensor_next[s_name][x]
 
-                # if best_val == float("inf") and current_val == float("inf"):
-                #     new_values[s_name][x] = current_val
-                #     new_next[s_name][x] = best_next
-                #     continue
-
-                # --- local movement update ONLY if sensor sees node ---
-                if x in observed:
-                    for y in self.G.neighbors(x):
+                if x in observed:                                           # if *observed* movement node
+                    for y in self.G.neighbors(x):                           # for each adjacent movement node
                         if self.G[x][y]["blocked"]:
                             continue
 
@@ -826,8 +830,7 @@ class DistributedRoutingEngine:
                             best_val = candidate
                             best_next = y
 
-                # --- communication update (always allowed) ---
-                for s2 in self.C.neighbors(s_name):
+                for s2 in self.C.neighbors(s_name):                         # for each neighboring sensor
                     candidate = self.sensor_values[s2][x]
 
                     if candidate < best_val:
@@ -840,58 +843,10 @@ class DistributedRoutingEngine:
         self.sensor_values = new_values
         self.sensor_next = new_next
 
-    def validate_sensor_coverage(self) -> None:
-        """
-        Validate that every movement node is observed by at least one sensor.
-
-        This is required for distributed routing to work correctly.
-
-        Let:
-        $$
-        O_s \subseteq V
-        $$
-        be the set of nodes observed by sensor $s$.
-
-        The required condition is:
-        $$
-        \bigcup_{s \in S} O_s = V
-        $$
-
-        If this condition is not satisfied, then some nodes cannot update their
-        routing values because no sensor has visibility on them.
-
-        In that case, the algorithm is invalid and we abort execution.
-        """
-
-        uncovered_nodes = []
-
-        for n in self.G.nodes:
-            observed = False
-
-            for s in self.sensors.values():
-                if n in s.observed_nodes:
-                    observed = True
-                    break
-
-            if not observed:
-                uncovered_nodes.append(n)
-
-        if uncovered_nodes:
-            print("\n❌ ERROR: Incomplete sensor coverage\n")
-            print("The following movement nodes are NOT observed by any sensor:\n")
-
-            for n in uncovered_nodes:
-                print(f"  - {n}")
-
-            print("\n💡 Fix: add sensors or increase sensor range so that every node is observed.\n")
-
-            raise RuntimeError("Distributed routing cannot proceed: incomplete sensor coverage.")
-
-    def run(self, steps: int = 30) -> None:
-        # Questo è necessario perché quando blocchi/sblocchi archi, i valori devono poter anche aumentare.
-        # Con l’algoritmo attuale solo-min, senza reset rimangono stime vecchie.
+    def run(self, steps: int = 40) -> None:
+        # Reset is required because this min-only relaxation cannot correct
+        # old optimistic values after edge costs increase.
         self._initialize()
-        
         for _ in range(steps):
             self.step()
 
@@ -908,9 +863,150 @@ class DistributedRoutingEngine:
             node_values[n] = best
 
         return node_values
-    
+
     def get_local_policy(self, sensor_name: str) -> Dict[str, Optional[str]]:
         return self.sensor_next[sensor_name]
+
+
+class DistributedDiffusionStrategy(RoutingStrategy):
+    """
+    Distributed routing strategy.
+
+    This wraps DistributedDiffusionEngine behind the same RoutingStrategy
+    interface used by centralized algorithms.
+
+    It exposes:
+    - distributed node value field for heatmap
+    - local sensor policy arrows
+    - exact path fallback for visual path display
+
+    The exact path fallback is only for viewer convenience. The distributed
+    algorithm itself produces local sensor policies, not a single global
+    next-pointer field.
+    """
+
+    def __init__(
+        self,
+        movement_graph: nx.Graph,
+        communication_graph: nx.Graph,
+        sensors: Dict[str, Sensor],
+        controller: MovementGraphController,
+        steps: int = 40,
+    ) -> None:
+        super().__init__(movement_graph)
+        self.engine = DistributedDiffusionEngine(movement_graph, communication_graph, sensors)
+        self.sensors = sensors
+        self.controller = controller
+        self.steps = steps
+
+    def has_global_policy(self) -> bool:
+        return False
+
+    def validate_sensor_coverage(self) -> None:
+        self.engine.validate_sensor_coverage()
+
+    def recompute(self) -> None:
+        self.engine.run(steps=self.steps)
+
+        node_vals = self.engine.extract_node_field()
+
+        for n in self.G.nodes:
+            self.G.nodes[n]["value"] = node_vals[n]
+            self.G.nodes[n]["next"] = None
+
+    def get_value(self, node: str) -> float:
+        return float(self.G.nodes[node]["value"])
+
+    def get_next(self, node: str) -> Optional[str]:
+        return None
+
+    def get_path(self, start: str) -> Tuple[List[str], float]:
+        return self.controller.shortest_path_to_nearest_exit(start)
+
+    def sensor_policy_arrows(self) -> List[Tuple[np.ndarray, np.ndarray]]:
+        arrows = []
+
+        for s_name, s in self.sensors.items():
+            anchor = s.metadata.get("anchor_node")
+            if anchor is None:
+                continue
+
+            local_policy = self.engine.get_local_policy(s_name)
+            nxt = local_policy.get(anchor)
+
+            if nxt is None:
+                continue
+
+            if self.G[anchor][nxt]["blocked"]:
+                continue
+
+            p0 = np.array(s.position, dtype=float)
+            p1 = self.G.nodes[nxt]["position"]
+
+            direction = p1 - p0
+            norm = np.linalg.norm(direction)
+
+            if norm > 1e-9:
+                arrows.append((p0, direction / norm))
+
+        return arrows
+
+    def debug_sensor_line(self, sensor_name: str, sensor: Sensor) -> str:
+        anchor = sensor.metadata.get("anchor_node")
+        obs_count = len(sensor.observed_nodes)
+        nxt = self.engine.get_local_policy(sensor_name).get(anchor) if anchor else None
+        return f"  {sensor_name}: anchor={anchor}, next={nxt}, obs={obs_count}, policy=local"
+
+
+class StrategyManager:
+    """
+    Runtime registry for routing strategies.
+
+    The viewer owns only this manager. It does not know which concrete
+    algorithms exist.
+
+    Add a new routing algorithm by:
+
+    $$
+    manager.register("dstar-lite", DStarLiteStrategy(...))
+    $$
+
+    without changing InteractiveBuildingViewer.
+    """
+
+    def __init__(self) -> None:
+        self._strategies: Dict[str, RoutingStrategy] = {}
+        self._current: Optional[str] = None
+
+    def register(self, name: str, strategy: RoutingStrategy) -> None:
+        self._strategies[name] = strategy
+        if self._current is None:
+            self._current = name
+
+    def names(self) -> List[str]:
+        return list(self._strategies.keys())
+
+    def current_name(self) -> str:
+        if self._current is None:
+            raise RuntimeError("No routing strategy registered.")
+        return self._current
+
+    def current(self) -> RoutingStrategy:
+        return self._strategies[self.current_name()]
+
+    def set(self, name: str) -> None:
+        if name not in self._strategies:
+            raise KeyError(f"Unknown strategy: {name}")
+        self._current = name
+
+    def next(self) -> None:
+        names = self.names()
+        if not names:
+            raise RuntimeError("No routing strategies registered.")
+
+        idx = names.index(self.current_name())
+        self._current = names[(idx + 1) % len(names)]
+
 
 # ============================================================
 # COMMUNICATION ENGINE
@@ -918,15 +1014,19 @@ class DistributedRoutingEngine:
 
 class CommunicationEngine:
     """
-    Builds a communication graph from sensor positions and communication range.
+    Builds the communication graph from sensor positions and ranges.
 
     This graph is independent from the movement graph:
-    - nodes are sensors/controllers/lights
-    - edges exist if devices are within mutual range
+
+    $$
+    G_C = (S,L)
+    $$
+
+    where an edge exists when two sensors are within mutual communication
+    range.
     """
 
     def __init__(self, sensors: Dict[str, Sensor]) -> None:
-        # TODO: Add assumption check: strong connectivity of the sensors --> global reachability and info
         self.sensors = sensors
         self.communication_graph = nx.Graph()
         self.rebuild()
@@ -938,7 +1038,7 @@ class CommunicationEngine:
             G.add_node(
                 name,
                 position=np.array(s.position, dtype=float),
-                range_radius=s.range_radius
+                range_radius=s.range_radius,
             )
 
         names = list(self.sensors.keys())
@@ -959,93 +1059,60 @@ class CommunicationEngine:
 
         self.communication_graph = G
 
-    def sensor_policy_arrows(self, movement_graph: nx.Graph) -> List[Tuple[np.ndarray, np.ndarray]]:
+    def validate_connectivity(self) -> None:
         """
-        One arrow per sensor using GLOBAL centralized policy.
+        Optional distributed assumption check.
 
-        The sensor arrow is based on the sensor's anchor movement node,
-        not on the best arbitrary observed node.
+        Strong connectivity is not meaningful for this undirected graph;
+        ordinary connectivity is the relevant condition:
+
+        $$
+        \forall s,q \in S, \exists \text{ communication path } s \leadsto q
+        $$
+
+        If the graph is disconnected, distributed information may remain
+        trapped in isolated sensor components.
         """
-        arrows = []
+        if self.communication_graph.number_of_nodes() == 0:
+            raise RuntimeError("Communication graph has no sensors.")
 
-        for s in self.sensors.values():
-            anchor = s.metadata.get("anchor_node")
+        if not nx.is_connected(self.communication_graph):
+            components = list(nx.connected_components(self.communication_graph))
+            print("\nWARNING: Communication graph is disconnected.")
+            for i, comp in enumerate(components):
+                print(f"  component {i}: {sorted(comp)}")
 
-            if anchor is None:
-                continue
-
-            nxt = movement_graph.nodes[anchor].get("next")
-
-            if nxt is None:
-                continue
-
-            if movement_graph[anchor][nxt]["blocked"]:
-                continue
-
-            p0 = np.array(s.position, dtype=float)
-            p1 = movement_graph.nodes[nxt]["position"]
-
-            direction = p1 - p0
-            norm = np.linalg.norm(direction)
-
-            if norm > 1e-9:
-                arrows.append((p0, direction / norm))
-
-        return arrows
-    
-    def sensor_policy_arrows_local(self, distributed) -> List[Tuple[np.ndarray, np.ndarray]]:
-        """
-        One arrow per sensor using LOCAL distributed policy.
-
-        The arrow is based on the sensor's anchor movement node.
-        """
-        arrows = []
-        G = distributed.G
-
-        for s_name, s in self.sensors.items():
-            anchor = s.metadata.get("anchor_node")
-
-            if anchor is None:
-                continue
-
-            local_policy = distributed.get_local_policy(s_name)
-            nxt = local_policy.get(anchor)
-
-            if nxt is None:
-                continue
-
-            if G[anchor][nxt]["blocked"]:
-                continue
-
-            p0 = np.array(s.position, dtype=float)
-            p1 = G.nodes[nxt]["position"]
-
-            direction = p1 - p0
-            norm = np.linalg.norm(direction)
-
-            if norm > 1e-9:
-                arrows.append((p0, direction / norm))
-
-        return arrows
 
 # ============================================================
 # INTERACTIVE VISUALIZATION
 # ============================================================
 
 class InteractiveBuildingViewer:
+    """
+    3D PyVista viewer.
+
+    The viewer is routing-algorithm agnostic.
+
+    It depends on:
+    - BuildingGeometry for static geometry
+    - MovementGraphController for edge mutation
+    - StrategyManager for routing computation
+    - CommunicationEngine only for visualizing sensor links
+
+    It does not know which concrete strategy is currently active.
+    """
+
     def __init__(
         self,
         geometry: BuildingGeometry,
-        routing: RoutingEngine,
-        distributed_routing: DistributedRoutingEngine,
+        controller: MovementGraphController,
+        strategy_manager: StrategyManager,
         communication: CommunicationEngine,
     ) -> None:
         self.geometry = geometry
+        self.controller = controller
+        self.strategies = strategy_manager
         self.communication = communication
-        self.routing = routing
-        self.distributed = distributed_routing
-        self.use_distributed = False
-        
 
         self.G = geometry.movement_graph
         self.C = communication.communication_graph
@@ -1053,14 +1120,13 @@ class InteractiveBuildingViewer:
         self.plotter = pv.Plotter(window_size=(1450, 900))
         self.plotter.set_background("white")
 
-        self.start_nodes = [
-            n for n, a in self.G.nodes(data=True)
-            if a["kind"] == "room"
-        ]
+        self.start_nodes = [n for n, a in self.G.nodes(data=True) if a["kind"] == "room"]
+        if not self.start_nodes:
+            raise RuntimeError("No room nodes available as start nodes.")
 
         self.start_index = 0
         self.current_start = self.start_nodes[self.start_index]
-        
+
         self.edge_list = list(self.G.edges())
         self.selected_edge_index = 0
 
@@ -1075,40 +1141,84 @@ class InteractiveBuildingViewer:
 
         self.selected_node_actor = None
         self.selected_edge_actor = None
-        self.pick_mode = "node"  # or "edge"
+
+        self.pick_mode = "node"
+
+        self.current_path: Optional[List[str]] = None
+        self.field_cost: Optional[float] = None
+        self.exact_cost: Optional[float] = None
+        self.error: Optional[str] = None
+
+    # ----------------------------
+    # Strategy access
+    # ----------------------------
+
+    def strategy(self) -> RoutingStrategy:
+        return self.strategies.current()
+
+    # ----------------------------
+    # UI actions
+    # ----------------------------
 
     def next_start(self) -> None:
-        if not self.start_nodes:
-            return
-
         self.start_index = (self.start_index + 1) % len(self.start_nodes)
         self.current_start = self.start_nodes[self.start_index]
-
+        self._highlight_selected_node(self.current_start)
         self.refresh_path_only()
-
 
     def prev_start(self) -> None:
-        if not self.start_nodes:
-            return
-
         self.start_index = (self.start_index - 1) % len(self.start_nodes)
         self.current_start = self.start_nodes[self.start_index]
-
+        self._highlight_selected_node(self.current_start)
         self.refresh_path_only()
+
+    def cycle_edge(self) -> None:
+        self.selected_edge_index = (self.selected_edge_index + 1) % len(self.edge_list)
+        u, v = self._selected_edge()
+        self._highlight_selected_edge(u, v)
+        self.redraw_selection_only()
+
+    def toggle_selected_edge(self) -> None:
+        u, v = self._selected_edge()
+        self.controller.toggle_edge(u, v)
+        self._highlight_selected_edge(u, v)
+        self.refresh_full()
+
+    def reset_edges(self) -> None:
+        self.controller.reset_edges()
+        self.refresh_full()
+
+    def next_strategy(self) -> None:
+        self.strategies.next()
+        print(f"Strategy: {self.strategies.current_name()}")
+        self.refresh_full()
+
+    def _set_pick_node_mode(self) -> None:
+        self.pick_mode = "node"
+        self._update_text()
+
+    def _set_pick_edge_mode(self) -> None:
+        self.pick_mode = "edge"
+        self._update_text()
+
+    # ----------------------------
+    # Checkbox UI
+    # ----------------------------
 
     def _add_button(self, callback, position, label, size=32):
         """
-        Checkbox behaving like a push-button + label
+        Checkbox behaving like a push button.
+
+        PyVista installations do not always expose add_button_widget,
+        while add_checkbox_button_widget is widely available.
         """
-        widget = None  # closure handle
+        widget = None
 
         def _cb(state):
             if state:
                 callback()
-                # reset immediately → behave like button
                 if widget is not None:
-                    rep = widget.GetRepresentation()
-                    rep.SetState(0)
+                    widget.GetRepresentation().SetState(0)
 
         widget = self.plotter.add_checkbox_button_widget(
             _cb,
@@ -1120,7 +1230,6 @@ class InteractiveBuildingViewer:
             border_size=1,
         )
 
-        # label
         self.plotter.add_text(
             label,
             position=(position[0] + size + 10, position[1] + 5),
@@ -1128,44 +1237,44 @@ class InteractiveBuildingViewer:
         )
 
         return widget
+    
+    def _add_ui(self) -> None:
+        x0 = 10
+        y0 = 10
+        dy = 45
+        num_buttons = 5
 
-    def _set_pick_node_mode(self):
-        self.pick_mode = "node"
+        y = y0 + num_buttons * dy
 
-    def _set_pick_edge_mode(self):
-        self.pick_mode = "edge"
+        # self._add_button(self.prev_start, (x0, y), "Prev Start")
+        # y -= dy
 
-    def _highlight_selected_node(self, node_id: str) -> None:
-        # remove previous actor
-        if self.selected_node_actor is not None:
-            self.plotter.remove_actor(self.selected_node_actor)
-            self.selected_node_actor = None
+        # self._add_button(self.next_start, (x0, y), "Next Start")
+        # y -= dy
 
-        pos = self.G.nodes[node_id]["position"]
+        # self._add_button(self.toggle_selected_edge, (x0, y), "Toggle Edge")
+        # y -= dy
 
-        sphere = pv.Sphere(radius=0.8, center=pos)
+        self._add_button(self.reset_edges, (x0, y), "Reset Edges")
+        y -= dy
 
-        self.selected_node_actor = self.plotter.add_mesh(
-            sphere,
-            color="yellow",
-            smooth_shading=True,
-        )
+        self._add_button(self.next_strategy, (x0, y), "Next Strategy")
+        y -= dy
 
-    def _highlight_selected_edge(self, u, v):
-        if self.selected_edge_actor is not None:
-            self.plotter.remove_actor(self.selected_edge_actor)
-            self.selected_edge_actor = None
+        # self._add_button(self.cycle_edge, (x0, y), "Next Edge")
+        # y -= dy
 
-        p0 = self.G.nodes[u]["position"]
-        p1 = self.G.nodes[v]["position"]
+        self._add_button(self.print_path_info, (x0, y), "Print Path")
+        y -= dy
 
-        line = pv.Line(p0, p1)
+        self._add_button(self._set_pick_node_mode, (x0, y), "Pick: Node")
+        y -= dy
 
-        self.selected_edge_actor = self.plotter.add_mesh(
-            line,
-            color="orange",
-            line_width=12,
-        )
+        self._add_button(self._set_pick_edge_mode, (x0, y), "Pick: Edge")
+
+    # ----------------------------
+    # Picking
+    # ----------------------------
 
     def _on_point_picked(self, point, *args):
         if point is None:
@@ -1178,18 +1287,17 @@ class InteractiveBuildingViewer:
         elif self.pick_mode == "edge":
             self._pick_edge(p)
 
-    def _pick_node(self, p):
+    def _pick_node(self, p: np.ndarray) -> None:
         best_node = None
         best_dist = float("inf")
 
         for n, attrs in self.G.nodes(data=True):
-            d = np.linalg.norm(attrs["position"] - p)
+            d = float(np.linalg.norm(attrs["position"] - p))
             if d < best_dist:
                 best_dist = d
                 best_node = n
 
-        # threshold (IMPORTANT)
-        if best_dist > 3.0:
+        if best_node is None or best_dist > 3.0:
             return
 
         if self.G.nodes[best_node]["kind"] != "room":
@@ -1203,14 +1311,18 @@ class InteractiveBuildingViewer:
         self._highlight_selected_node(best_node)
         self.refresh_path_only()
 
-    def _point_to_segment_distance(self, p, a, b):
+    def _point_to_segment_distance(self, p: np.ndarray, a: np.ndarray, b: np.ndarray) -> Tuple[float, np.ndarray]:
         ab = b - a
-        t = np.dot(p - a, ab) / np.dot(ab, ab)
+        denom = float(np.dot(ab, ab))
+        if denom < 1e-12:
+            return float(np.linalg.norm(p - a)), a
+
+        t = float(np.dot(p - a, ab) / denom)
         t = np.clip(t, 0.0, 1.0)
         proj = a + t * ab
-        return np.linalg.norm(p - proj), proj
+        return float(np.linalg.norm(p - proj)), proj
 
-    def _pick_edge(self, p):
+    def _pick_edge(self, p: np.ndarray) -> None:
         best_edge = None
         best_dist = float("inf")
 
@@ -1218,80 +1330,64 @@ class InteractiveBuildingViewer:
             a = self.G.nodes[u]["position"]
             b = self.G.nodes[v]["position"]
 
-            dist, proj = self._point_to_segment_distance(p, a, b)
+            dist, _ = self._point_to_segment_distance(p, a, b)
 
             if dist < best_dist:
                 best_dist = dist
                 best_edge = (u, v)
 
-        if best_edge is None:
-            return
-
-        # threshold to avoid accidental clicks
-        if best_dist > 2.0:
+        if best_edge is None or best_dist > 2.5:
             return
 
         u, v = best_edge
 
-        # toggle block
-        self.routing.toggle_edge(u, v)
+        self.controller.toggle_edge(u, v)
 
-        # update selection index too
         canonical = self._canonical_edge(u, v)
-        if canonical in self.edge_list:
-            self.selected_edge_index = self.edge_list.index(canonical)
+        canonical_edges = [self._canonical_edge(a, b) for a, b in self.edge_list]
+        if canonical in canonical_edges:
+            self.selected_edge_index = canonical_edges.index(canonical)
 
-        # recompute FULL (topology changed)
         self._highlight_selected_edge(u, v)
         self.refresh_full()
 
-    def _add_ui(self) -> None:
-        """
-        Clean vertical control panel (no keyboard)
-        """
+    # ----------------------------
+    # Actor highlights
+    # ----------------------------
 
-        x0 = 10
-        y0 = 10
-        dy = 45
-        num_buttons = 9
+    def _highlight_selected_node(self, node_id: str) -> None:
+        if self.selected_node_actor is not None:
+            self.plotter.remove_actor(self.selected_node_actor)
+            self.selected_node_actor = None
 
-        y = y0 + num_buttons * dy
+        pos = self.G.nodes[node_id]["position"]
+        sphere = pv.Sphere(radius=0.8, center=pos)
 
-        # --- START NAVIGATION ---
-        self._add_button(self.prev_start, (x0, y), "Prev Start")
-        y -= dy
+        self.selected_node_actor = self.plotter.add_mesh(
+            sphere,
+            color="yellow",
+            smooth_shading=True,
+            pickable=False,
+        )
 
-        self._add_button(self.next_start, (x0, y), "Next Start")
-        y -= dy
+    def _highlight_selected_edge(self, u: str, v: str) -> None:
+        if self.selected_edge_actor is not None:
+            self.plotter.remove_actor(self.selected_edge_actor)
+            self.selected_edge_actor = None
 
-        # --- EDGE CONTROL ---
-        self._add_button(self.toggle_selected_edge, (x0, y), "Toggle Edge")
-        y -= dy
+        p0 = self.G.nodes[u]["position"]
+        p1 = self.G.nodes[v]["position"]
 
-        self._add_button(self.reset_edges, (x0, y), "Reset Edges")
-        y -= dy
+        self.selected_edge_actor = self.plotter.add_mesh(
+            pv.Line(p0, p1),
+            color="orange",
+            line_width=12,
+            pickable=False,
+        )
 
-        # --- ROUTING MODE ---
-        def _toggle_distributed_wrapper():
-            self.toggle_distributed()
-
-        self._add_button(_toggle_distributed_wrapper, (x0, y), "Toggle Distributed")
-        y -= dy
-
-        # --- GRAPH NAVIGATION ---
-        self._add_button(self.cycle_edge, (x0, y), "Next Edge")
-        y -= dy
-
-        # --- DEBUG ---
-        self._add_button(self.print_path_info, (x0, y), "Print Path")
-        y -= dy
-
-        # --- PICK MODE ---
-        self._add_button(self._set_pick_node_mode, (x0, y), "Pick: Node")
-        y -= dy
-
-        self._add_button(self._set_pick_edge_mode, (x0, y), "Pick: Edge")
-        y -= dy
+    # ----------------------------
+    # Static scene
+    # ----------------------------
 
     def _canonical_edge(self, u: str, v: str) -> Tuple[str, str]:
         return tuple(sorted((u, v)))
@@ -1316,33 +1412,26 @@ class InteractiveBuildingViewer:
                 opacity=s.opacity,
                 show_edges=True,
                 line_width=1,
+                pickable=False,
             )
 
     def _add_movement_graph(self) -> None:
-        self.node_positions = []
-        self.node_ids = []
-        
         points = []
         labels = []
 
         for n, attrs in self.G.nodes(data=True):
-            pos = attrs["position"]
-            points.append(pos)
+            points.append(attrs["position"])
             labels.append(n)
-
-            self.node_positions.append(pos)
-            self.node_ids.append(n)
 
         pts = np.array(points)
         pdata = pv.PolyData(pts)
-
-        self.node_mesh = pdata  # ← IMPORTANT
 
         self.plotter.add_mesh(
             pdata,
             color="black",
             point_size=15,
             render_points_as_spheres=True,
+            pickable=True,
         )
 
         self.plotter.add_point_labels(
@@ -1358,7 +1447,12 @@ class InteractiveBuildingViewer:
             p1 = self.G.nodes[v]["position"]
             line = pv.Line(p0, p1)
 
-            actor = self.plotter.add_mesh(line, color="gray", line_width=5)
+            actor = self.plotter.add_mesh(
+                line,
+                color="gray",
+                line_width=5,
+                pickable=True,
+            )
             self.edge_actors[self._canonical_edge(u, v)] = actor
 
     def _add_sensors_and_communication_graph(self) -> None:
@@ -1377,6 +1471,7 @@ class InteractiveBuildingViewer:
             color="orange",
             point_size=18,
             render_points_as_spheres=True,
+            pickable=False,
         )
 
         self.plotter.add_point_labels(
@@ -1390,21 +1485,19 @@ class InteractiveBuildingViewer:
         for u, v in self.C.edges:
             p0 = self.C.nodes[u]["position"]
             p1 = self.C.nodes[v]["position"]
-            line = pv.Line(p0, p1)
 
             self.plotter.add_mesh(
-                line,
+                pv.Line(p0, p1),
                 color="deepskyblue",
                 line_width=2,
                 opacity=0.35,
+                pickable=False,
             )
 
     def _add_stair_geometry(self) -> None:
         stair_pairs = []
 
-        levels = sorted({
-            attrs["level"] for _, attrs in self.G.nodes(data=True)
-        })
+        levels = sorted({attrs["level"] for _, attrs in self.G.nodes(data=True)})
 
         for level in levels[:-1]:
             stair_pairs.append((f"SE{level}", f"SE{level+1}"))
@@ -1414,14 +1507,18 @@ class InteractiveBuildingViewer:
             p0 = self.G.nodes[a]["position"]
             p1 = self.G.nodes[b]["position"]
 
-            line = pv.Line(p0, p1)
-            tube = line.tube(radius=0.35)
+            tube = pv.Line(p0, p1).tube(radius=0.35)
 
             self.plotter.add_mesh(
                 tube,
                 color="purple",
                 opacity=0.75,
+                pickable=False,
             )
+
+    # ----------------------------
+    # Dynamic drawing
+    # ----------------------------
 
     def _draw_policy_arrows(self) -> None:
         for actor in self.policy_arrow_actors:
@@ -1429,8 +1526,11 @@ class InteractiveBuildingViewer:
 
         self.policy_arrow_actors.clear()
 
+        if not self.strategy().has_global_policy():
+            return
+
         for n, attrs in self.G.nodes(data=True):
-            nxt = attrs.get("next")
+            nxt = self.strategy().get_next(n)
 
             if nxt is None:
                 continue
@@ -1444,13 +1544,11 @@ class InteractiveBuildingViewer:
             if norm < 1e-9:
                 continue
 
-            arrow = pv.Arrow(
-                start=p0,
-                direction=direction / norm,
-                scale=1.3,
+            actor = self.plotter.add_mesh(
+                pv.Arrow(start=p0, direction=direction / norm, scale=1.3),
+                color="royalblue",
+                pickable=False,
             )
-
-            actor = self.plotter.add_mesh(arrow, color="royalblue")
             self.policy_arrow_actors.append(actor)
 
     def _draw_sensor_policy_arrows(self) -> None:
@@ -1459,30 +1557,46 @@ class InteractiveBuildingViewer:
 
         self.sensor_arrow_actors.clear()
 
-        for start, direction in self.communication.sensor_policy_arrows(self.G):
-            arrow = pv.Arrow(start=start, direction=direction, scale=1.1)
-            actor = self.plotter.add_mesh(arrow, color="darkorange")
-            self.sensor_arrow_actors.append(actor)
+        arrows = self.strategy().sensor_policy_arrows()
 
-    def _draw_sensor_policy_arrows_local(self) -> None:
-        for actor in self.sensor_arrow_actors:
-            self.plotter.remove_actor(actor)
+        # Centralized strategies usually do not define sensor arrows, so derive
+        # them from the global policy using each sensor anchor.
+        if not arrows and self.strategy().has_global_policy():
+            for s in self.geometry.sensors.values():
+                anchor = s.metadata.get("anchor_node")
+                if anchor is None:
+                    continue
 
-        self.sensor_arrow_actors.clear()
+                nxt = self.strategy().get_next(anchor)
+                if nxt is None:
+                    continue
 
-        arrows = self.communication.sensor_policy_arrows_local(self.distributed)
+                if self.G[anchor][nxt]["blocked"]:
+                    continue
+
+                p0 = np.array(s.position, dtype=float)
+                p1 = self.G.nodes[nxt]["position"]
+
+                direction = p1 - p0
+                norm = np.linalg.norm(direction)
+
+                if norm > 1e-9:
+                    arrows.append((p0, direction / norm))
 
         for start, direction in arrows:
-            arrow = pv.Arrow(start=start, direction=direction, scale=1.1)
-            actor = self.plotter.add_mesh(arrow, color="darkorange")
+            actor = self.plotter.add_mesh(
+                pv.Arrow(start=start, direction=direction, scale=1.1),
+                color="darkorange",
+                pickable=False,
+            )
             self.sensor_arrow_actors.append(actor)
 
     def _draw_heatmap(self) -> None:
         points = []
         values = []
 
-        for _, attrs in self.G.nodes(data=True):
-            val = attrs["value"]
+        for n, attrs in self.G.nodes(data=True):
+            val = self.strategy().get_value(n)
             points.append(attrs["position"])
             values.append(100.0 if np.isinf(val) else val)
 
@@ -1500,6 +1614,7 @@ class InteractiveBuildingViewer:
             cmap="coolwarm",
             show_scalar_bar=True,
             scalar_bar_args={"title": "Routing value"},
+            pickable=False,
         )
 
     def _draw_path(self, path: Optional[List[str]]) -> None:
@@ -1517,6 +1632,7 @@ class InteractiveBuildingViewer:
             poly,
             color="lime",
             line_width=10,
+            pickable=False,
         )
 
     def _update_edge_colors(self, path: Optional[List[str]]) -> None:
@@ -1547,6 +1663,34 @@ class InteractiveBuildingViewer:
                 if not blocked and edge not in path_edges:
                     actor.prop.color = (1.0, 0.65, 0.0)
 
+    # ----------------------------
+    # Text/debug
+    # ----------------------------
+
+    def _sensor_debug_text(self, max_lines: int = 6) -> List[str]:
+        lines = ["Sensor debug:"]
+
+        for i, (s_name, s) in enumerate(self.geometry.sensors.items()):
+            if i >= max_lines:
+                remaining = len(self.geometry.sensors) - max_lines
+                lines.append(f"  ... {remaining} more sensors")
+                break
+
+            custom_line = self.strategy().debug_sensor_line(s_name, s)
+            if custom_line:
+                lines.append(custom_line)
+                continue
+
+            anchor = s.metadata.get("anchor_node")
+            obs_count = len(s.observed_nodes)
+            nxt = self.strategy().get_next(anchor) if anchor else None
+
+            lines.append(
+                f"  {s_name}: anchor={anchor}, next={nxt}, obs={obs_count}, policy=global"
+            )
+
+        return lines
+
     def _status_text(
         self,
         path: Optional[List[str]],
@@ -1556,16 +1700,19 @@ class InteractiveBuildingViewer:
     ) -> str:
         u, v = self._selected_edge()
         blocked = self.G[u][v]["blocked"]
-        value = self.G.nodes[self.current_start]["value"]
+
+        value = self.strategy().get_value(self.current_start)
         value_text = "inf" if np.isinf(value) else f"{value:.2f}"
 
         lines = [
             f"Start: {self.current_start}",
+            f"Pick mode: {self.pick_mode}",
             f"Selected movement edge: ({u}, {v}) | blocked={blocked}",
             f"Value at start: {value_text}",
             f"Communication nodes: {self.C.number_of_nodes()} | links: {self.C.number_of_edges()}",
-            f"Mode: {'DISTRIBUTED' if self.use_distributed else 'CENTRALIZED'}"
+            f"Strategy: {self.strategies.current_name()}",
         ]
+
         lines.extend(self._sensor_debug_text())
 
         if error:
@@ -1579,79 +1726,9 @@ class InteractiveBuildingViewer:
 
     def _help_text(self) -> str:
         return (
-            "Keys: 1..6 select start | n next edge | b block/unblock | "
-            "d distributed | r reset | p print path | h help"
+            "UI: buttons only | Pick Node selects start | Pick Edge toggles block | "
+            "Next Strategy cycles algorithms"
         )
-    def _sensor_debug_text(self, max_lines: int = 6) -> List[str]:
-        lines = ["Sensor debug:"]
-
-        for i, (s_name, s) in enumerate(self.geometry.sensors.items()):
-            if i >= max_lines:
-                remaining = len(self.geometry.sensors) - max_lines
-                lines.append(f"  ... {remaining} more sensors")
-                break
-
-            anchor = s.metadata.get("anchor_node")
-            obs_count = len(s.observed_nodes)
-
-            if self.use_distributed:
-                nxt = self.distributed.get_local_policy(s_name).get(anchor) if anchor else None
-                mode = "local"
-            else:
-                nxt = self.G.nodes[anchor].get("next") if anchor else None
-                mode = "global"
-
-            lines.append(
-                f"  {s_name}: anchor={anchor}, next={nxt}, obs={obs_count}, policy={mode}"
-            )
-
-        return lines
-
-    def recompute_routing(self) -> None:
-        if not self.use_distributed:
-            self.routing.run_diffusion(steps=40)
-        else:
-            self.distributed.run(steps=40)
-
-            node_vals = self.distributed.extract_node_field()
-
-            for n in self.G.nodes:
-                self.G.nodes[n]["value"] = node_vals[n]
-                self.G.nodes[n]["next"] = None
-
-        # AFTER global recompute → compute path once
-        self._recompute_path()
-
-    def _clear_policy_arrows(self) -> None:
-        for actor in self.policy_arrow_actors:
-            self.plotter.remove_actor(actor)
-        self.policy_arrow_actors.clear()
-
-    def redraw_full(self) -> None:
-        self._draw_path(self.current_path)
-        self._draw_heatmap()
-
-        if not self.use_distributed:
-            # global arrows
-            self._draw_policy_arrows()
-            self._draw_sensor_policy_arrows()
-        else:
-            # local arrows only
-            self._clear_policy_arrows()
-            self._draw_sensor_policy_arrows_local()
-
-        self._update_edge_colors(self.current_path)
-        self._update_text()
-        self.plotter.render()
-
-    def redraw_selection_only(self) -> None:
-        # Only edge highlighting changes
-        self._update_edge_colors(self.current_path)
-
-        # Only status text needs update (selected edge info changed)
-        self._update_text()
-
-        self.plotter.render()
 
     def _update_text(self) -> None:
         self.plotter.remove_actor(self.status_actor_name, render=False)
@@ -1676,13 +1753,13 @@ class InteractiveBuildingViewer:
             name=self.help_actor_name,
         )
 
-    def refresh_full(self) -> None:
-        """
-        Recompute EVERYTHING (used when graph changes)
-        """
-        self.recompute_routing()
-        self.redraw_full()
+    # ----------------------------
+    # Recompute/redraw
+    # ----------------------------
 
+    def recompute_routing(self) -> None:
+        self.strategy().recompute()
+        self._recompute_path()
 
     def _recompute_path(self) -> None:
         self.current_path = None
@@ -1691,57 +1768,51 @@ class InteractiveBuildingViewer:
         self.error = None
 
         try:
-            if not self.use_distributed:
-                self.current_path, self.field_cost = \
-                    self.routing.greedy_path_from_field(self.current_start)
-            else:
-                # distributed: no global next → use exact path
-                self.current_path, self.field_cost = \
-                    self.routing.shortest_path_to_nearest_exit(self.current_start)
-
-            _, self.exact_cost = \
-                self.routing.shortest_path_to_nearest_exit(self.current_start)
-
+            self.current_path, self.field_cost = self.strategy().get_path(self.current_start)
+            _, self.exact_cost = self.controller.shortest_path_to_nearest_exit(self.current_start)
         except Exception as exc:
             self.error = str(exc)
 
-    def refresh_path_only(self) -> None:
-        """
-        Only recompute path from current start (cheap)
-        """
-        self._recompute_path()
+    def refresh_full(self) -> None:
+        self.recompute_routing()
         self.redraw_full()
 
-    def select_start(self, index: int) -> None:
-        self.current_start = self.start_nodes[index]
-        self.refresh_path_only()
+    def refresh_path_only(self) -> None:
+        self._recompute_path()
+        self._redraw_path_only()
 
-    def cycle_edge(self) -> None:
-        self.selected_edge_index = (self.selected_edge_index + 1) % len(self.edge_list)
-        self.redraw_selection_only()
+    def redraw_full(self) -> None:
+        self._draw_path(self.current_path)
+        self._draw_heatmap()
+        self._draw_policy_arrows()
+        self._draw_sensor_policy_arrows()
+        self._update_edge_colors(self.current_path)
+        self._update_text()
+        self.plotter.render()
 
-    def toggle_selected_edge(self) -> None:
-        u, v = self._selected_edge()
-        self.routing.toggle_edge(u, v)
-        self.refresh_full()
+    def _redraw_path_only(self) -> None:
+        self._draw_path(self.current_path)
+        self._update_edge_colors(self.current_path)
+        self._update_text()
+        self.plotter.render()
 
-    def toggle_distributed(self) -> None:
-        self.use_distributed = not self.use_distributed
-        print(f"Distributed mode: {self.use_distributed}")
-        self.refresh_full()
+    def redraw_selection_only(self) -> None:
+        self._update_edge_colors(self.current_path)
+        self._update_text()
+        self.plotter.render()
 
-    def reset_edges(self) -> None:
-        self.routing.reset_edges()
-        self.refresh_full()
+    # ----------------------------
+    # Debug prints
+    # ----------------------------
 
     def print_path_info(self) -> None:
         try:
-            self.routing.run_diffusion(steps=40)
-            path, cost = self.routing.greedy_path_from_field(self.current_start)
-            exact_path, exact_cost = self.routing.shortest_path_to_nearest_exit(self.current_start)
+            path, cost = self.strategy().get_path(self.current_start)
+            exact_path, exact_cost = self.controller.shortest_path_to_nearest_exit(self.current_start)
 
             print("\n=== Routing Info ===")
-            print(f"Start: {self.current_start}")
+            print(f"Strategy   : {self.strategies.current_name()}")
+            print(f"Start      : {self.current_start}")
             print(f"Field path : {' -> '.join(path)}")
             print(f"Field cost : {cost:.2f}")
             print(f"Exact path : {' -> '.join(exact_path)}")
@@ -1750,45 +1821,36 @@ class InteractiveBuildingViewer:
         except Exception as exc:
             print(f"\nRouting error: {exc}\n")
 
-    def print_help(self) -> None:
-        print("\n=== Controls ===")
-        print("1..6 : select start node")
-        print("n    : select next movement edge")
-        print("d    : toggle distributed computing")
-        print("b    : block/unblock selected movement edge")
-        print("r    : reset all blocked edges")
-        print("p    : print routing info")
-        print("h    : print this help")
-        print()
+    # ----------------------------
+    # Scene lifecycle
+    # ----------------------------
 
     def build_scene(self) -> None:
         self._add_spaces()
         self._add_stair_geometry()
         self._add_movement_graph()
-
         self._add_sensors_and_communication_graph()
         self._add_ui()
+
         self.plotter.show_grid()
 
-        # self.plotter.enable_point_picking(
-        #     callback=self._on_point_picked,
-        #     use_mesh=True,
-        #     show_message=False,
-        #     pickable_window=False,
-        # )
+        # Surface point picking works better in a dense 3D scene.
+        # Decorative geometry is marked pickable=False so picking targets
+        # graph nodes/edges instead of room/corridor volumes.
         self.plotter.enable_surface_point_picking(
             callback=self._on_point_picked,
             show_point=True,
             clear_on_no_selection=True,
-            font_size=0
+            font_size=0,
         )
 
         self.refresh_full()
         self._highlight_selected_node(self.current_start)
+        u, v = self._selected_edge()
+        self._highlight_selected_edge(u, v)
 
     def show(self) -> None:
         self.build_scene()
-        self.print_help()
         self.plotter.show()
 
 
@@ -1797,21 +1859,45 @@ class InteractiveBuildingViewer:
 # ============================================================
 
 def main() -> None:
-    geometry = BuildingGeometry.demo_building(num_floors=1)
+    NUM_FLOORS = 2
 
+    geometry = BuildingGeometry.demo_building(num_floors=NUM_FLOORS)
+
+    controller = MovementGraphController(geometry.movement_graph)
     communication = CommunicationEngine(geometry.sensors)
-    
-    routing = RoutingEngine(geometry.movement_graph)
-    distributed_routing = DistributedRoutingEngine(
+
+    # Structural checks are run at setup time.
+    # Re-run reachability after topology changes if you decide to enforce
+    # hard failures instead of allowing "no path" states during interaction.
+    controller.validate_reachability()
+
+    manager = StrategyManager()
+
+    manager.register(
+        "centralized-diffusion",
+        CentralizedDiffusionStrategy(
+            geometry.movement_graph,
+            controller,
+            steps=40,
+        ),
+    )
+
+    distributed = DistributedDiffusionStrategy(
         geometry.movement_graph,
         communication.communication_graph,
         geometry.sensors,
+        controller,
+        steps=40,
     )
+    distributed.validate_sensor_coverage()
+    communication.validate_connectivity()
+
+    manager.register("distributed-diffusion", distributed)
 
     viewer = InteractiveBuildingViewer(
         geometry=geometry,
-        routing=routing,
-        distributed_routing=distributed_routing,
+        controller=controller,
+        strategy_manager=manager,
         communication=communication,
     )
 
