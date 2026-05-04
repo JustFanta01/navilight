@@ -1106,7 +1106,15 @@ class DistributedBellmanGossipEngine:
                     if self._edge_is_blocked_locally(st, x, y):
                         continue
                     edge_cost = self._edge_cost_locally(st, x, y)
-                    candidates.append((edge_cost + st.values.get(y, float("inf")), y))
+                    y_val = st.values.get(y, float("inf"))
+                    candidate = edge_cost + y_val
+                    # Safety invariant for displayed local policy: only use a
+                    # next-hop that strictly decreases the local potential.
+                    # Since edge costs are positive, any finite Bellman candidate
+                    # satisfies y_val < candidate. If this is not true, the
+                    # estimate is inconsistent and no arrow should be emitted yet.
+                    if not np.isinf(candidate) and y_val < candidate - self.epsilon:
+                        candidates.append((candidate, y))
 
             # Communication candidate: latest estimates heard from neighbor
             # sensors. For an observed movement node, local physical Bellman
@@ -1119,6 +1127,8 @@ class DistributedBellmanGossipEngine:
 
             if candidates:
                 best_value, best_next = min(candidates, key=lambda item: item[0])
+                if np.isinf(best_value):
+                    best_next = None
             else:
                 best_value, best_next = float("inf"), None
 
@@ -1249,11 +1259,22 @@ class DistributedBellmanGossipEngine:
             best_val = float("inf")
             best_next = None
 
+            x_val = node_values.get(x, float("inf"))
             for y in self.G.neighbors(x):
                 if bool(self.G[x][y].get("blocked", False)):
                     continue
-                candidate = float(self.G[x][y].get("base_weight", self.G[x][y]["weight"])) + node_values.get(y, float("inf"))
-                if candidate < best_val:
+                y_val = node_values.get(y, float("inf"))
+                candidate = float(self.G[x][y].get("base_weight", self.G[x][y]["weight"])) + y_val
+                # Safe displayed policy: require Bellman consistency and strict
+                # descent in the aggregate value field. If transient estimates
+                # are contradictory, show no direction instead of a loop.
+                if (
+                    not np.isinf(x_val)
+                    and not np.isinf(y_val)
+                    and y_val < x_val - self.epsilon
+                    and abs(candidate - x_val) <= max(self.epsilon, 1e-5 * max(1.0, abs(x_val)))
+                    and candidate < best_val
+                ):
                     best_val = candidate
                     best_next = y
 
@@ -1266,6 +1287,126 @@ class DistributedBellmanGossipEngine:
 
     def get_sensor_value(self, sensor_name: str, node: str) -> float:
         return self.states[sensor_name].values.get(node, float("inf"))
+
+
+    def local_bellman_candidate(self, sensor_name: str, node: str) -> Tuple[float, Optional[str]]:
+        """Return the current one-step Bellman RHS for one sensor/node."""
+        st = self.states[sensor_name]
+        if self.G.nodes[node]["kind"] == "exit":
+            return 0.0, None
+        if node not in st.observed_nodes:
+            return self._best_peer_value(st, node)
+
+        best_value = float("inf")
+        best_next = None
+        for y in self.G.neighbors(node):
+            if self._edge_is_blocked_locally(st, node, y):
+                continue
+            y_val = st.values.get(y, float("inf"))
+            candidate = self._edge_cost_locally(st, node, y) + y_val
+            if not np.isinf(candidate) and y_val < candidate - self.epsilon and candidate < best_value:
+                best_value = candidate
+                best_next = y
+        return best_value, best_next
+
+    def local_policy_is_safe(self, sensor_name: str, node: str) -> bool:
+        """True iff the local next-hop is a strict potential descent."""
+        st = self.states[sensor_name]
+        nxt = st.next_hops.get(node)
+        if self.G.nodes[node]["kind"] == "exit":
+            return True
+        if nxt is None or not self.G.has_edge(node, nxt):
+            return False
+        if self._edge_is_blocked_locally(st, node, nxt):
+            return False
+        v_node = st.values.get(node, float("inf"))
+        v_next = st.values.get(nxt, float("inf"))
+        return (not np.isinf(v_node)) and (not np.isinf(v_next)) and v_next < v_node - self.epsilon
+
+    def local_bellman_residual(self, sensor_name: str, node: str) -> float:
+        """Absolute local residual |V - BellmanRHS| for diagnostics."""
+        st = self.states[sensor_name]
+        lhs = st.values.get(node, float("inf"))
+        rhs, _ = self.local_bellman_candidate(sensor_name, node)
+        if np.isinf(lhs) and np.isinf(rhs):
+            return 0.0
+        if np.isinf(lhs) != np.isinf(rhs):
+            return float("inf")
+        return abs(lhs - rhs)
+
+    def exact_node_field_for_diagnostics(self) -> Dict[str, float]:
+        """Centralized Dijkstra field, used only as a UI/debug reference."""
+        exits = [n for n, a in self.G.nodes(data=True) if a["kind"] == "exit"]
+        vals: Dict[str, float] = {}
+        for n in self.G.nodes:
+            best = float("inf")
+            for ex in exits:
+                try:
+                    path = nx.shortest_path(self.G, n, ex, weight="weight")
+                    best = min(best, float(nx.path_weight(self.G, path, weight="weight")))
+                except nx.NetworkXNoPath:
+                    pass
+            vals[n] = best
+        return vals
+
+    def global_diagnostics(self) -> Dict[str, float]:
+        field = self.extract_node_field()
+        exact = self.exact_node_field_for_diagnostics()
+        max_error = 0.0
+        wrong = 0
+        for n in self.G.nodes:
+            a, b = field[n], exact[n]
+            if np.isinf(a) and np.isinf(b):
+                err = 0.0
+            elif np.isinf(a) != np.isinf(b):
+                err = float("inf")
+            else:
+                err = abs(a - b)
+            if np.isinf(err) or err > max(self.epsilon, 1e-5):
+                wrong += 1
+            if np.isinf(err):
+                max_error = float("inf")
+            elif not np.isinf(max_error):
+                max_error = max(max_error, err)
+
+        unsafe = 0
+        rows = self.sensor_table_rows()
+        for row in rows:
+            if row["safe"] == "NO":
+                unsafe += 1
+        return {"wrong_nodes": float(wrong), "max_error": max_error, "unsafe_sensor_anchors": float(unsafe)}
+
+    def sensor_table_rows(self) -> List[Dict[str, str]]:
+        rows: List[Dict[str, str]] = []
+        for s_name, sensor in self.sensors.items():
+            st = self.states[s_name]
+            anchor = sensor.metadata.get("anchor_node")
+            if anchor is None:
+                rows.append({
+                    "sensor": s_name, "anchor": "-", "V": "inf", "rhs": "inf", "res": "inf",
+                    "next": "-", "safe": "NO", "dirty": str(len(st.dirty)),
+                    "inbox": str(len(st.inbox)), "chg": str(len(st.changed_values) + len(st.changed_edge_status)),
+                })
+                continue
+            val = st.values.get(anchor, float("inf"))
+            rhs, rhs_next = self.local_bellman_candidate(s_name, anchor)
+            res = self.local_bellman_residual(s_name, anchor)
+            nxt = st.next_hops.get(anchor)
+            safe = "OK" if self.local_policy_is_safe(s_name, anchor) else "NO"
+            rows.append({
+                "sensor": s_name,
+                "anchor": str(anchor),
+                "V": "inf" if np.isinf(val) else f"{val:.1f}",
+                "rhs": "inf" if np.isinf(rhs) else f"{rhs:.1f}",
+                "res": "inf" if np.isinf(res) else f"{res:.1g}",
+                "next": str(nxt) if nxt is not None else "-",
+                "rhs_next": str(rhs_next) if rhs_next is not None else "-",
+                "safe": safe,
+                "dirty": str(len(st.dirty)),
+                "inbox": str(len(st.inbox)),
+                "chg": str(len(st.changed_values) + len(st.changed_edge_status)),
+            })
+        return rows
 
 
 class DistributedBellmanGossipStrategy(RoutingStrategy):
@@ -1385,6 +1526,9 @@ class DistributedBellmanGossipStrategy(RoutingStrategy):
             if nxt is None:
                 continue
 
+            if not self.engine.local_policy_is_safe(s_name, anchor):
+                continue
+
             # Use real graph state for drawing. The sensor may still be
             # transiently wrong; do not draw known-blocked arrows.
             if self.G.has_edge(anchor, nxt) and self.G[anchor][nxt]["blocked"]:
@@ -1414,12 +1558,26 @@ class DistributedBellmanGossipStrategy(RoutingStrategy):
         )
 
     def debug_summary(self) -> str:
+        diag = self.engine.global_diagnostics()
+        max_err = diag["max_error"]
+        max_err_txt = "inf" if np.isinf(max_err) else f"{max_err:.2g}"
         return (
             f"gossip ticks={self.engine.tick_count} | pending={self.engine.pending_work()} | "
             f"repairs={self.engine.last_local_repairs} | changes={self.engine.last_value_changes} | "
-            f"msgs={self.engine.last_messages_sent}"
+            f"msgs={self.engine.last_messages_sent} | wrong_nodes={int(diag['wrong_nodes'])} | "
+            f"max_err={max_err_txt} | unsafe_anchors={int(diag['unsafe_sensor_anchors'])}"
         )
 
+    def sensor_table_rows(self) -> List[Dict[str, str]]:
+        return self.engine.sensor_table_rows()
+
+    def settle_until_quiet(self, max_ticks: int = 500) -> None:
+        self.engine.run_until_quiet(max_ticks=max_ticks)
+        self._publish_to_graph()
+
+
+# Backward-compatible alias used by older code paths.
+DistributedDiffusionStrategy = DistributedBellmanGossipStrategy
 
 class StrategyManager:
     """
@@ -1601,6 +1759,7 @@ class InteractiveBuildingViewer:
 
         self.status_actor_name = "status_text"
         self.help_actor_name = "help_text"
+        self.sensor_table_actor_name = "sensor_table_text"
 
         self.selected_node_actor = None
         self.selected_edge_actor = None
@@ -1613,7 +1772,7 @@ class InteractiveBuildingViewer:
         self.error: Optional[str] = None
 
         self.gossip_ticks_per_click = 1
-        self.gossip_settle_ticks = 80
+        self.gossip_settle_ticks = 500
 
     # ----------------------------
     # Strategy access
@@ -1675,7 +1834,9 @@ class InteractiveBuildingViewer:
 
     def settle_gossip(self) -> None:
         strat = self.strategy()
-        if hasattr(strat, "tick"):
+        if hasattr(strat, "settle_until_quiet"):
+            strat.settle_until_quiet(max_ticks=self.gossip_settle_ticks)
+        elif hasattr(strat, "tick"):
             strat.tick(self.gossip_settle_ticks)
         self.refresh_after_incremental_update()
 
@@ -1738,6 +1899,7 @@ class InteractiveBuildingViewer:
             (self.next_strategy, "Next Strategy"),
             (self.tick_gossip_once, "Tick Gossip"),
             (self.settle_gossip, "Settle Gossip"),
+            (self.print_sensor_table, "Print Sensor Table"),
             (self.print_path_info, "Print Path"),
             (self._set_pick_node_mode, "Pick: Node"),
             (self._set_pick_edge_mode, "Pick: Edge"),
@@ -2207,12 +2369,30 @@ class InteractiveBuildingViewer:
     def _help_text(self) -> str:
         return (
             "Pick Node selects start | Pick Edge toggles block | "
-            "Tick/Settle Gossip advances distributed Bellman propagation"
+            "Tick Gossip = one logical iteration | Settle Gossip = run until quiet"
         )
+
+    def _sensor_table_text(self) -> str:
+        strat = self.strategy()
+        if not hasattr(strat, "sensor_table_rows"):
+            return "Sensor table unavailable for this strategy"
+
+        rows = strat.sensor_table_rows()
+        header = f"{'Sensor':<12} {'Anchor':<8} {'V':>6} {'RHS':>6} {'Res':>6} {'Next':<8} {'Safe':<4} {'D':>3} {'I':>3} {'Ch':>3}"
+        sep = "-" * len(header)
+        lines = ["Per-sensor Bellman/Gossip state", header, sep]
+        for r in rows:
+            lines.append(
+                f"{r['sensor']:<12} {r['anchor']:<8} {r['V']:>6} {r['rhs']:>6} {r['res']:>6} "
+                f"{r['next']:<8} {r['safe']:<4} {r['dirty']:>3} {r['inbox']:>3} {r['chg']:>3}"
+            )
+        lines.append("D=dirty, I=inbox, Ch=pending deltas; Safe=local strict-descent anchor policy")
+        return "\n".join(lines)
 
     def _update_text(self) -> None:
         self.plotter.remove_actor(self.status_actor_name, render=False)
         self.plotter.remove_actor(self.help_actor_name, render=False)
+        self.plotter.remove_actor(self.sensor_table_actor_name, render=False)
 
         self.plotter.add_text(
             self._status_text(
@@ -2231,6 +2411,13 @@ class InteractiveBuildingViewer:
             position="lower_left",
             font_size=10,
             name=self.help_actor_name,
+        )
+
+        self.plotter.add_text(
+            self._sensor_table_text(),
+            position="upper_right",
+            font_size=8,
+            name=self.sensor_table_actor_name,
         )
 
     # ----------------------------
@@ -2288,6 +2475,9 @@ class InteractiveBuildingViewer:
     # ----------------------------
     # Debug prints
     # ----------------------------
+
+    def print_sensor_table(self) -> None:
+        print("\n" + self._sensor_table_text() + "\n")
 
     def print_path_info(self) -> None:
         try:
@@ -2372,7 +2562,7 @@ def main() -> None:
         geometry.sensors,
         controller,
         bootstrap_ticks=160,
-        ticks_per_event=6,
+        ticks_per_event=1, # 6
         # 0 means broadcast deltas to all communication neighbors.
         # Use 1 or 2 for stricter randomized gossip.
         gossip_fanout=0,
