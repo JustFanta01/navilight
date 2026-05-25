@@ -1,87 +1,36 @@
 """
 ============================================================
-SMART BUILDING NAVIGATION SIMULATION — STRATEGY REFACTOR
+NAVILIGHT — SMART BUILDING ROUTING SIMULATION
 ============================================================
 
-This simulation models evacuation routing in a building using three
-separate layers:
+Single-file research/prototype simulator for evacuation guidance in a
+multi-floor building.
 
-1. MOVEMENT GRAPH  G_M = (V, A)
-   - Nodes = physical positions: rooms, junctions, stairs, exits
-   - Edges = walkable paths with traversal costs
-   - Defines the physical walkability of the building
+The model is intentionally split into:
 
-2. COMMUNICATION GRAPH  G_C = (S, L)
-   - Nodes = sensors/controllers
-   - Edges = communication links between nearby devices
-   - Defines how routing information can be exchanged
+1. Movement graph G_M
+   Physical walkability: rooms, junctions, stairs, exits and weighted paths.
 
-3. ROUTING STRATEGIES
-   - A RoutingStrategy exposes the same interface regardless of algorithm
-   - The viewer only talks to StrategyManager.current()
-   - New algorithms, such as D* Lite, can be registered without changing
-     the viewer
+2. Communication graph G_C
+   Information flow between fixed sensors/controllers.
 
-------------------------------------------------------------
+3. Routing strategies
+   A common interface for centralized Bellman routing and incremental
+   distributed Bellman + gossip routing.
 
-CURRENT STRATEGIES
-------------------------------------------------------------
+4. Viewer
+   PyVista-only interaction and visualization layer.
 
-CENTRALIZED DIFFUSION:
-    - Synchronous Bellman value diffusion on the movement graph
-    - Has full knowledge of G_M
-    - Produces a global value field V(x) and policy pi(x)
+Important assumptions of the distributed prototype:
+- every sensor knows the movement graph topology;
+- edge blocked/unblocked state is observed locally and then gossiped;
+- every movement node must be observed by at least one sensor;
+- the communication graph should be connected;
+- messages are simulated in-memory and are reliable;
+- sensors currently keep full value tables for debugging/visualization.
 
-DISTRIBUTED DIFFUSION:
-    - Each sensor keeps local estimates V_s(x)
-    - Sensors update observed movement nodes locally
-    - Sensors exchange estimates through G_C
-    - Produces a distributed approximation of the global value field
-
-------------------------------------------------------------
-
-MATHEMATICAL IDEA
-------------------------------------------------------------
-
-The desired value field is the shortest distance to the nearest exit:
-
-$$
-V(x) = \min_{e \in E} d(x,e)
-$$
-
-The Bellman fixed point is:
-
-$$
-V(x)=
-\begin{cases}
-0, & x \in E \\
-\min\limits_{y \in \mathcal{N}(x)}
-\left(c(x,y)+V(y)\right), & x \notin E
-\end{cases}
-$$
-
-The induced routing policy is:
-
-$$
-\pi(x)=
-\arg\min_{y \in \mathcal{N}(x)}
-\left(c(x,y)+V(y)\right)
-$$
-
-------------------------------------------------------------
-
-KEY ARCHITECTURAL IDEA
-------------------------------------------------------------
-
-Movement graph      = physics
-Communication graph = information flow
-Routing strategy    = algorithm
-Viewer              = visualization and interaction only
-
-The viewer is algorithm-agnostic.
-It does not know whether the current algorithm is centralized,
-distributed, D* Lite, or something else.
-
+This is a technical simulation and debugging tool, not a production evacuation
+controller.
 ============================================================
 """
 
@@ -485,73 +434,89 @@ class MovementGraphController:
     """
     Owns graph mutation operations.
 
-    Routing strategies compute policies, but they do not own user actions
-    such as blocking/unblocking edges. This controller centralizes mutation
-    of edge state so all strategies see the same movement graph.
+    Routing strategies compute policies; this controller owns user-driven
+    physical changes such as blocking/unblocking edges.
+
+    Blocked edges are represented explicitly with a boolean. The base traversal
+    cost is kept unchanged; routing code should skip blocked edges instead of
+    treating them as merely very expensive paths.
+
+    Each edge also carries a monotonically increasing ``version``. The
+    distributed gossip layer uses this to ignore stale edge-state messages.
     """
 
     def __init__(self, movement_graph: nx.Graph) -> None:
         self.G = movement_graph
+        for u, v in self.G.edges:
+            self.G[u][v].setdefault("blocked", False)
+            self.G[u][v].setdefault("version", 0)
+            self.G[u][v].setdefault("base_weight", self.G[u][v].get("weight", 1.0))
+            self.G[u][v]["weight"] = self.G[u][v]["base_weight"]
 
-    def set_edge_blocked(self, u: str, v: str, blocked: bool = True) -> None:
+    def set_edge_blocked(self, u: str, v: str, blocked: bool = True) -> bool:
+        """Set physical edge state. Return True only if the state changed."""
+        old = bool(self.G[u][v].get("blocked", False))
+        if old == blocked:
+            return False
+
         self.G[u][v]["blocked"] = blocked
-        self.G[u][v]["weight"] = 1e9 if blocked else self.G[u][v]["base_weight"]
+        self.G[u][v]["version"] = int(self.G[u][v].get("version", 0)) + 1
+        # Keep weight equal to base_weight. Blocked semantics are explicit.
+        self.G[u][v]["weight"] = self.G[u][v]["base_weight"]
+        return True
 
-    def toggle_edge(self, u: str, v: str) -> None:
-        self.set_edge_blocked(u, v, not self.G[u][v]["blocked"])
+    def toggle_edge(self, u: str, v: str) -> bool:
+        return self.set_edge_blocked(u, v, not bool(self.G[u][v].get("blocked", False)))
 
     def reset_edges(self) -> None:
         for u, v in self.G.edges:
             self.set_edge_blocked(u, v, False)
 
+    def active_subgraph(self) -> nx.Graph:
+        """View of the movement graph that hides blocked edges."""
+        return nx.subgraph_view(
+            self.G,
+            filter_edge=lambda u, v: not bool(self.G[u][v].get("blocked", False)),
+        )
+
+    def path_cost(self, path: List[str]) -> float:
+        cost = 0.0
+        for a, b in zip(path, path[1:]):
+            if bool(self.G[a][b].get("blocked", False)):
+                raise nx.NetworkXNoPath("Path contains a blocked edge.")
+            cost += float(self.G[a][b].get("base_weight", self.G[a][b].get("weight", 1.0)))
+        return cost
+
     def shortest_path_to_nearest_exit(self, start: str) -> Tuple[List[str], float]:
         exits = [n for n, a in self.G.nodes(data=True) if a["kind"] == "exit"]
+        active = self.active_subgraph()
 
         best_path = None
         best_cost = float("inf")
 
         for ex in exits:
             try:
-                path = nx.shortest_path(self.G, start, ex, weight="weight")
-                cost = float(nx.path_weight(self.G, path, weight="weight"))
+                path = nx.shortest_path(active, start, ex, weight="base_weight")
+                cost = self.path_cost(path)
                 if cost < best_cost:
                     best_path = path
                     best_cost = cost
             except nx.NetworkXNoPath:
                 pass
 
-        if best_path is None or best_cost >= 1e9:
+        if best_path is None:
             raise nx.NetworkXNoPath(f"No path from {start} to any exit.")
 
         return best_path, best_cost
 
     def validate_reachability(self) -> None:
-        """
-        Ensure every movement node can reach at least one exit.
-
-        Required condition:
-
-        $$
-        \forall x \in V, \exists e \in E : x \leadsto e
-        $$
-
-        This check is structural. Run it when topology/blocked edges change,
-        not at every path query.
-        """
+        """Ensure every movement node can reach at least one exit through unblocked edges."""
         exits = [n for n, a in self.G.nodes(data=True) if a["kind"] == "exit"]
+        active = self.active_subgraph()
         unreachable = []
 
         for n in self.G.nodes:
-            reachable = False
-            for ex in exits:
-                try:
-                    nx.shortest_path(self.G, n, ex, weight="weight")
-                    reachable = True
-                    break
-                except nx.NetworkXNoPath:
-                    continue
-
-            if not reachable:
+            if not any(nx.has_path(active, n, ex) for ex in exits):
                 unreachable.append(n)
 
         if unreachable:
@@ -612,16 +577,16 @@ class RoutingStrategy(ABC):
         return ""
 
 
-class CentralizedDiffusionStrategy(RoutingStrategy):
+class CentralizedBellmanStrategy(RoutingStrategy):
     """
-    Centralized Bellman diffusion strategy.
+    Centralized synchronous Bellman strategy.
 
     Boundary condition:
 
     $$
     V_0(x)=
     \begin{cases}
-    0, & x \in E \\
+    0, & x \in E \
     +\infty, & x \notin E
     \end{cases}
     $$
@@ -631,7 +596,7 @@ class CentralizedDiffusionStrategy(RoutingStrategy):
     $$
     V_{k+1}(x)=
     \begin{cases}
-    0, & x \in E \\
+    0, & x \in E \
     \min\limits_{y \in \mathcal{N}(x)}
     \left(c(x,y)+V_k(y)\right), & x \notin E
     \end{cases}
@@ -649,9 +614,8 @@ class CentralizedDiffusionStrategy(RoutingStrategy):
     approximately one graph edge per iteration.
     """
 
-    def __init__(self, movement_graph: nx.Graph, controller: MovementGraphController, steps: int = 40) -> None:
+    def __init__(self, movement_graph: nx.Graph, steps: int = 40) -> None:
         super().__init__(movement_graph)
-        self.controller = controller
         self.steps = steps
 
     def initialize_values(self) -> None:
@@ -659,11 +623,11 @@ class CentralizedDiffusionStrategy(RoutingStrategy):
             attrs["value"] = 0.0 if attrs["kind"] == "exit" else float("inf")
             attrs["next"] = None
 
-    def diffusion_step(self) -> None:
+    def bellman_step(self) -> None:
         new_values = {}
         new_next = {}
 
-        for x, attrs in self.G.nodes(data=True): # for each movement node
+        for x, attrs in self.G.nodes(data=True):
             if attrs["kind"] == "exit":
                 new_values[x] = 0.0
                 new_next[x] = None
@@ -676,7 +640,7 @@ class CentralizedDiffusionStrategy(RoutingStrategy):
                 if self.G[x][y]["blocked"]:
                     continue
 
-                candidate = self.G.nodes[y]["value"] + self.G[x][y]["weight"]
+                candidate = self.G.nodes[y]["value"] + self.G[x][y].get("base_weight", self.G[x][y]["weight"])
 
                 if candidate < best_value:
                     best_value = candidate
@@ -695,7 +659,7 @@ class CentralizedDiffusionStrategy(RoutingStrategy):
         self.initialize_values()
         
         for _ in range(self.steps):
-            self.diffusion_step()
+            self.bellman_step()
 
     def get_value(self, node: str) -> float:
         return float(self.G.nodes[node]["value"])
@@ -733,6 +697,18 @@ class CentralizedDiffusionStrategy(RoutingStrategy):
         raise RuntimeError("Path reconstruction exceeded max_hops.")
 
 
+@dataclass(frozen=True)
+class EdgeObservation:
+    """Versioned observation of one physical edge state.
+
+    ``version`` is monotonically increased by MovementGraphController whenever
+    the real edge state changes. Gossip receivers ignore older observations.
+    """
+    blocked: bool
+    version: int
+    origin: str
+
+
 @dataclass
 class GossipMessage:
     """
@@ -749,7 +725,7 @@ class GossipMessage:
     sender: str
     values: Dict[str, float] = field(default_factory=dict)
     next_hops: Dict[str, Optional[str]] = field(default_factory=dict)
-    edge_status: Dict[Tuple[str, str], bool] = field(default_factory=dict)
+    edge_status: Dict[Tuple[str, str], EdgeObservation] = field(default_factory=dict)
 
 
 @dataclass
@@ -769,7 +745,7 @@ class SensorNodeState:
     observed_nodes: Set[str]
     values: Dict[str, float]
     next_hops: Dict[str, Optional[str]]
-    edge_blocked: Dict[Tuple[str, str], bool]
+    edge_observations: Dict[Tuple[str, str], EdgeObservation]
     peer_values: Dict[str, Dict[str, float]] = field(default_factory=dict)
     peer_next_hops: Dict[str, Dict[str, Optional[str]]] = field(default_factory=dict)
     dirty: Deque[str] = field(default_factory=deque)
@@ -777,7 +753,7 @@ class SensorNodeState:
     inbox: Deque[GossipMessage] = field(default_factory=deque)
     changed_values: Dict[str, float] = field(default_factory=dict)
     changed_next_hops: Dict[str, Optional[str]] = field(default_factory=dict)
-    changed_edge_status: Dict[Tuple[str, str], bool] = field(default_factory=dict)
+    changed_edge_status: Dict[Tuple[str, str], EdgeObservation] = field(default_factory=dict)
 
 
 class DistributedBellmanGossipEngine:
@@ -805,7 +781,6 @@ class DistributedBellmanGossipEngine:
       may increase too and that increase is propagated as a delta.
     """
 
-    INF_EDGE = 1e9
 
     def __init__(
         self,
@@ -839,9 +814,13 @@ class DistributedBellmanGossipEngine:
     def _canonical_edge(self, u: str, v: str) -> Tuple[str, str]:
         return tuple(sorted((u, v)))
 
-    def _all_edge_status(self) -> Dict[Tuple[str, str], bool]:
+    def _all_edge_status(self) -> Dict[Tuple[str, str], EdgeObservation]:
         return {
-            self._canonical_edge(u, v): bool(self.G[u][v].get("blocked", False))
+            self._canonical_edge(u, v): EdgeObservation(
+                blocked=bool(self.G[u][v].get("blocked", False)),
+                version=int(self.G[u][v].get("version", 0)),
+                origin="controller",
+            )
             for u, v in self.G.edges
         }
 
@@ -852,7 +831,7 @@ class DistributedBellmanGossipEngine:
         This is not used after every edge change. It is used at startup and
         after a user-triggered global reset of all edges.
         """
-        edge_status = self._all_edge_status()
+        edge_observations = self._all_edge_status()
         self.states.clear()
 
         for s_name, sensor in self.sensors.items():
@@ -868,7 +847,7 @@ class DistributedBellmanGossipEngine:
                 observed_nodes=set(sensor.observed_nodes),
                 values=values,
                 next_hops=next_hops,
-                edge_blocked=dict(edge_status),
+                edge_observations=dict(edge_observations),
             )
 
             for peer in self.C.neighbors(s_name):
@@ -972,7 +951,11 @@ class DistributedBellmanGossipEngine:
         nearby Bellman values, and gossip the edge-state delta.
         """
         e = self._canonical_edge(u, v)
-        blocked = bool(self.G[u][v].get("blocked", False))
+        observation = EdgeObservation(
+            blocked=bool(self.G[u][v].get("blocked", False)),
+            version=int(self.G[u][v].get("version", 0)),
+            origin="local-observer",
+        )
 
         observers = [
             st for st in self.states.values()
@@ -988,8 +971,8 @@ class DistributedBellmanGossipEngine:
             ]
 
         for st in observers:
-            st.edge_blocked[e] = blocked
-            st.changed_edge_status[e] = blocked
+            st.edge_observations[e] = observation
+            st.changed_edge_status[e] = observation
             self._invalidate_dependent_values(st, {u, v})
             self._mark_neighborhood_dirty(st, u)
             self._mark_neighborhood_dirty(st, v)
@@ -1047,15 +1030,18 @@ class DistributedBellmanGossipEngine:
                 st.peer_values[msg.sender] = {}
                 st.peer_next_hops[msg.sender] = {}
 
-            for e, blocked in msg.edge_status.items():
-                previous = st.edge_blocked.get(e)
-                if previous != blocked:
-                    st.edge_blocked[e] = blocked
-                    u, v = e
-                    self._invalidate_dependent_values(st, {u, v})
-                    self._mark_neighborhood_dirty(st, u)
-                    self._mark_neighborhood_dirty(st, v)
-                    st.changed_edge_status[e] = blocked
+            for e, observation in msg.edge_status.items():
+                previous = st.edge_observations.get(e)
+                previous_version = -1 if previous is None else previous.version
+                if observation.version > previous_version:
+                    state_changed = previous is None or previous.blocked != observation.blocked
+                    st.edge_observations[e] = observation
+                    if state_changed:
+                        u, v = e
+                        self._invalidate_dependent_values(st, {u, v})
+                        self._mark_neighborhood_dirty(st, u)
+                        self._mark_neighborhood_dirty(st, v)
+                    st.changed_edge_status[e] = observation
 
             for node, value in msg.values.items():
                 previous = st.peer_values[msg.sender].get(node, float("inf"))
@@ -1069,11 +1055,10 @@ class DistributedBellmanGossipEngine:
     # ----------------------------
 
     def _edge_is_blocked_locally(self, st: SensorNodeState, u: str, v: str) -> bool:
-        return bool(st.edge_blocked.get(self._canonical_edge(u, v), False))
+        obs = st.edge_observations.get(self._canonical_edge(u, v))
+        return False if obs is None else bool(obs.blocked)
 
     def _edge_cost_locally(self, st: SensorNodeState, u: str, v: str) -> float:
-        if self._edge_is_blocked_locally(st, u, v):
-            return self.INF_EDGE
         return float(self.G[u][v].get("base_weight", self.G[u][v].get("weight", 1.0)))
 
     def _best_peer_value(self, st: SensorNodeState, node: str) -> Tuple[float, Optional[str]]:
@@ -1334,26 +1319,51 @@ class DistributedBellmanGossipEngine:
             return float("inf")
         return abs(lhs - rhs)
 
-    def exact_node_field_for_diagnostics(self) -> Dict[str, float]:
-        """Centralized Dijkstra field, used only as a UI/debug reference."""
+
+
+class DistributedDiagnostics:
+    """
+    Debug/validation helper for DistributedBellmanGossipEngine.
+
+    This is intentionally outside the routing engine: exact Dijkstra checks,
+    residual tables and UI summaries are diagnostics, not part of the
+    distributed algorithm itself.
+    """
+
+    def __init__(self, engine: DistributedBellmanGossipEngine) -> None:
+        self.engine = engine
+        self.G = engine.G
+
+    def exact_node_field(self) -> Dict[str, float]:
+        """Centralized shortest-distance field on the active movement graph."""
         exits = [n for n, a in self.G.nodes(data=True) if a["kind"] == "exit"]
+        active = nx.subgraph_view(
+            self.G,
+            filter_edge=lambda u, v: not bool(self.G[u][v].get("blocked", False)),
+        )
         vals: Dict[str, float] = {}
+
         for n in self.G.nodes:
             best = float("inf")
             for ex in exits:
                 try:
-                    path = nx.shortest_path(self.G, n, ex, weight="weight")
-                    best = min(best, float(nx.path_weight(self.G, path, weight="weight")))
+                    path = nx.shortest_path(active, n, ex, weight="base_weight")
+                    cost = 0.0
+                    for a, b in zip(path, path[1:]):
+                        cost += float(self.G[a][b].get("base_weight", self.G[a][b].get("weight", 1.0)))
+                    best = min(best, cost)
                 except nx.NetworkXNoPath:
                     pass
             vals[n] = best
+
         return vals
 
-    def global_diagnostics(self) -> Dict[str, float]:
-        field = self.extract_node_field()
-        exact = self.exact_node_field_for_diagnostics()
+    def global_summary(self) -> Dict[str, float]:
+        field = self.engine.extract_node_field()
+        exact = self.exact_node_field()
         max_error = 0.0
         wrong = 0
+
         for n in self.G.nodes:
             a, b = field[n], exact[n]
             if np.isinf(a) and np.isinf(b):
@@ -1362,37 +1372,46 @@ class DistributedBellmanGossipEngine:
                 err = float("inf")
             else:
                 err = abs(a - b)
-            if np.isinf(err) or err > max(self.epsilon, 1e-5):
+
+            if np.isinf(err) or err > max(self.engine.epsilon, 1e-5):
                 wrong += 1
             if np.isinf(err):
                 max_error = float("inf")
             elif not np.isinf(max_error):
                 max_error = max(max_error, err)
 
-        unsafe = 0
-        rows = self.sensor_table_rows()
-        for row in rows:
-            if row["safe"] == "NO":
-                unsafe += 1
-        return {"wrong_nodes": float(wrong), "max_error": max_error, "unsafe_sensor_anchors": float(unsafe)}
+        unsafe = sum(1 for row in self.sensor_table_rows() if row["safe"] == "NO")
+        return {
+            "wrong_nodes": float(wrong),
+            "max_error": max_error,
+            "unsafe_sensor_anchors": float(unsafe),
+        }
 
     def sensor_table_rows(self) -> List[Dict[str, str]]:
         rows: List[Dict[str, str]] = []
-        for s_name, sensor in self.sensors.items():
-            st = self.states[s_name]
+        for s_name, sensor in self.engine.sensors.items():
+            st = self.engine.states[s_name]
             anchor = sensor.metadata.get("anchor_node")
             if anchor is None:
                 rows.append({
-                    "sensor": s_name, "anchor": "-", "V": "inf", "rhs": "inf", "res": "inf",
-                    "next": "-", "safe": "NO", "dirty": str(len(st.dirty)),
-                    "inbox": str(len(st.inbox)), "chg": str(len(st.changed_values) + len(st.changed_edge_status)),
+                    "sensor": s_name,
+                    "anchor": "-",
+                    "V": "inf",
+                    "rhs": "inf",
+                    "res": "inf",
+                    "next": "-",
+                    "safe": "NO",
+                    "dirty": str(len(st.dirty)),
+                    "inbox": str(len(st.inbox)),
+                    "chg": str(len(st.changed_values) + len(st.changed_edge_status)),
                 })
                 continue
+
             val = st.values.get(anchor, float("inf"))
-            rhs, rhs_next = self.local_bellman_candidate(s_name, anchor)
-            res = self.local_bellman_residual(s_name, anchor)
+            rhs, rhs_next = self.engine.local_bellman_candidate(s_name, anchor)
+            res = self.engine.local_bellman_residual(s_name, anchor)
             nxt = st.next_hops.get(anchor)
-            safe = "OK" if self.local_policy_is_safe(s_name, anchor) else "NO"
+            safe = "OK" if self.engine.local_policy_is_safe(s_name, anchor) else "NO"
             rows.append({
                 "sensor": s_name,
                 "anchor": str(anchor),
@@ -1424,7 +1443,6 @@ class DistributedBellmanGossipStrategy(RoutingStrategy):
         movement_graph: nx.Graph,
         communication_graph: nx.Graph,
         sensors: Dict[str, Sensor],
-        controller: MovementGraphController,
         *,
         bootstrap_ticks: int = 120,
         ticks_per_event: int = 4,
@@ -1432,7 +1450,6 @@ class DistributedBellmanGossipStrategy(RoutingStrategy):
     ) -> None:
         super().__init__(movement_graph)
         self.sensors = sensors
-        self.controller = controller
         self.bootstrap_ticks = bootstrap_ticks
         self.ticks_per_event = ticks_per_event
         self.engine = DistributedBellmanGossipEngine(
@@ -1441,6 +1458,7 @@ class DistributedBellmanGossipStrategy(RoutingStrategy):
             sensors,
             gossip_fanout=gossip_fanout,
         )
+        self.diagnostics = DistributedDiagnostics(self.engine)
 
     def has_global_policy(self) -> bool:
         # The strategy exposes an aggregate policy only for path display; the
@@ -1558,7 +1576,7 @@ class DistributedBellmanGossipStrategy(RoutingStrategy):
         )
 
     def debug_summary(self) -> str:
-        diag = self.engine.global_diagnostics()
+        diag = self.diagnostics.global_summary()
         max_err = diag["max_error"]
         max_err_txt = "inf" if np.isinf(max_err) else f"{max_err:.2g}"
         return (
@@ -1569,15 +1587,12 @@ class DistributedBellmanGossipStrategy(RoutingStrategy):
         )
 
     def sensor_table_rows(self) -> List[Dict[str, str]]:
-        return self.engine.sensor_table_rows()
+        return self.diagnostics.sensor_table_rows()
 
     def settle_until_quiet(self, max_ticks: int = 500) -> None:
         self.engine.run_until_quiet(max_ticks=max_ticks)
         self._publish_to_graph()
 
-
-# Backward-compatible alias used by older code paths.
-DistributedDiffusionStrategy = DistributedBellmanGossipStrategy
 
 class StrategyManager:
     """
@@ -2548,10 +2563,9 @@ def main() -> None:
     manager = StrategyManager()
 
     manager.register(
-        "centralized-diffusion",
-        CentralizedDiffusionStrategy(
+        "centralized-bellman",
+        CentralizedBellmanStrategy(
             geometry.movement_graph,
-            controller,
             steps=40,
         ),
     )
@@ -2560,7 +2574,6 @@ def main() -> None:
         geometry.movement_graph,
         communication.communication_graph,
         geometry.sensors,
-        controller,
         bootstrap_ticks=160,
         ticks_per_event=1, # 6
         # 0 means broadcast deltas to all communication neighbors.
