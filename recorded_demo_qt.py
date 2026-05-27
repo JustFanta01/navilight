@@ -4,7 +4,7 @@ Dependencies:
     pip install pyvistaqt pyqt5
 
 Place this file next to the canonical ``navilight.py`` implementation and run:
-    python recorded_demo_qt.py --interval-ms 300 --ticks-per-update 1
+    python recorded_demo_qt.py --interval-ms 300 --ticks-per-update 1 --start-room R_A
 
 Why Qt:
     The standard ``pyvista.Plotter.add_timer_event`` path uses the VTK
@@ -56,10 +56,15 @@ class QtRecordedScenario:
         self.events = {
             event.tick: event
             for event in (
-                PhysicalEvent(16, "J1_E", "SE1", True, "Block east stair access on upper floor"),
-                PhysicalEvent(40, "J1_W", "SW1", True, "Block west stair access: upper floor isolated"),
-                PhysicalEvent(82, "J1_W", "SW1", False, "Restore west stair access: routes recover"),
-                PhysicalEvent(112, "J1_E", "SE1", False, "Restore east stair access"),
+                PhysicalEvent(16, "R_E", "J0_E", True, ""),
+                PhysicalEvent(40, "R_A", "J0_W", True, ""),
+                PhysicalEvent(82, "J0_E", "W0_CE", True, ""),
+                PhysicalEvent(112, "J0_W", "SW0", True, ""),
+                
+                # PhysicalEvent(116, "J1_E", "SE1", True, "Block east stair access on upper floor"),
+                # PhysicalEvent(140, "J1_W", "SW1", True, "Block west stair access: upper floor isolated"),
+                # PhysicalEvent(182, "J1_W", "SW1", False, "Restore west stair access: routes recover"),
+                # PhysicalEvent(212, "J1_E", "SE1", False, "Restore east stair access"),
             )
         }
 
@@ -92,7 +97,8 @@ class QtRecordedScenario:
         return changed
 
     def _banner(self) -> str:
-        route = self.strategy.engine.route_for_node("R_F")
+        start_room = self.viewer.current_start
+        route = self.strategy.engine.route_for_node(start_room)
         if route.reachable:
             next_hop = route.path[1] if len(route.path) > 1 else "-"
             route_text = "cost={:.1f}, next={}".format(route.cost, next_hop)
@@ -102,9 +108,9 @@ class QtRecordedScenario:
         return (
             "AUTOMATED PATH-VECTOR SCENARIO | {} | frame={}\n"
             "{}\n"
-            "Upper-floor room R_F: {}\n"
+            "Start room {}: {}\n"
             "Mouse: rotate/zoom/pan | SPACE: pause | D: input debug"
-        ).format(run_state, self.frame, self.message, route_text)
+        ).format(run_state, self.frame, self.message, start_room, route_text)
 
     def _update_banner(self) -> None:
         self.viewer.plotter.remove_actor("automated_scenario", render=False)
@@ -164,9 +170,14 @@ def main() -> None:
     parser.add_argument("--interval-ms", type=int, default=300, help="Scenario callback interval in milliseconds.")
     parser.add_argument("--ticks-per-update", type=int, default=1, help="Path-vector ticks per callback while messages are pending.")
     parser.add_argument("--frames", type=int, default=132, help="Number of scenario callback frames.")
+    parser.add_argument(
+        "--start-room",
+        default="R_A",
+        help="Room node to highlight and track in the scenario banner (one-floor demo: R_A, R_B, R_C, R_D or R_E).",
+    )
     args = parser.parse_args()
 
-    geometry, controller, communication, manager = navilight.build_application(num_floors=2)
+    geometry, controller, communication, manager = navilight.build_application(num_floors=1)
     manager.next()
     strategy = manager.current()
     if not isinstance(strategy, navilight.DistributedPathVectorStrategy):
@@ -189,10 +200,23 @@ def main() -> None:
     viewer.plotter.set_background("white")
     viewer.plotter.enable_trackball_style()
 
+    # A Qt timer may redraw while the user is rotating or zooming the camera.
+    # Never restore a saved camera position from those periodic callbacks:
+    # dynamic actors already use reset_camera=False, so interaction remains live.
+    viewer.preserve_camera_on_refresh = False
+
     # Geometry selection is intentionally disabled in recording mode. Camera
     # interaction and the built-in button widgets remain available.
-    viewer.build_scene()
-    viewer.current_start = "R_F"
+    viewer.build_scene(enable_picking=False)
+    valid_start_rooms = sorted(viewer.start_nodes)
+    if args.start_room not in valid_start_rooms:
+        parser.error(
+            "invalid --start-room {!r}; valid choices are: {}".format(
+                args.start_room,
+                ", ".join(valid_start_rooms),
+            )
+        )
+    viewer.current_start = args.start_room
     viewer._highlight_selected_node(viewer.current_start)
     viewer.refresh_path_only()
 
@@ -213,6 +237,7 @@ def main() -> None:
     viewer.plotter.render()
 
     print("Qt recording demo started.")
+    print("  Start room:", viewer.current_start)
     print("  Left drag: rotate | Right drag: zoom | Middle drag: pan")
     print("  Space: pause/resume | D: confirm keyboard input in terminal")
     _execute_qt_app(viewer.plotter)
