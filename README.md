@@ -1,7 +1,6 @@
 # Navilight
 
-![](navilight.mp4)
-<video src="./navilight.mp4" controls preload></video>
+![](navilight.gif)
 
 **Navilight** is a proof-of-concept simulator for **distributed adaptive evacuation guidance** in a smart building.
 
