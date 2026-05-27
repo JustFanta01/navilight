@@ -1,5 +1,8 @@
 # Navilight
 
+![](navilight.mp4)
+<video src="./navilight.mp4" controls preload></video>
+
 **Navilight** is a proof-of-concept simulator for **distributed adaptive evacuation guidance** in a smart building.
 
 Emergency guidance devices are attached to discrete routing waypoints. Each device independently selects the direction it displays using only:
