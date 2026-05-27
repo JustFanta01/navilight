@@ -803,16 +803,25 @@ class DistributedPathVectorStrategy(RoutingStrategy):
         return list(route.path), float(route.cost)
 
     def device_policy_arrows(self) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """Return uniformly sized local actuator directions.
+
+        The arrow represents the selected first-hop direction, not the metric
+        length of the physical edge. Every displayed actuator therefore uses
+        the same normalized vector and one fixed visual scale.
+        """
         arrows: List[Tuple[np.ndarray, np.ndarray]] = []
         for device in self.devices.values():
+            if not device.display:
+                continue
             node = device.controlled_node
             nxt = self.engine.next_for_node(node)
             if nxt is None or not self.engine.route_is_structurally_safe(node):
                 continue
-            direction = self.G.nodes[nxt]["position"] - np.array(device.position, dtype=float)
+            start = np.array(device.position, dtype=float)
+            direction = self.G.nodes[nxt]["position"] - start
             norm = float(np.linalg.norm(direction))
             if norm > 1e-9:
-                arrows.append((np.array(device.position, dtype=float), direction / norm))
+                arrows.append((start, direction / norm))
         return arrows
 
     def debug_device_line(self, device_name: str, device: GuidanceDevice) -> str:
@@ -909,9 +918,57 @@ class InteractiveBuildingViewer:
         self.field_cost: Optional[float] = None
         self.exact_cost: Optional[float] = None
         self.error: Optional[str] = None
+        # Manual mode protects an adjusted view across explicit redraws.
+        # Timer-driven Qt demos disable this: restoring a cached camera pose
+        # from each callback would fight trackball mouse interaction.
+        self.preserve_camera_on_refresh = True
+        self._scene_camera_initialized = False
 
     def strategy(self) -> RoutingStrategy:
         return self.strategies.current()
+
+    def _capture_camera_state(self) -> Dict[str, Any]:
+        """Capture the manually adjusted recording view before actor updates."""
+        return {
+            "camera_position": [
+                tuple(point) for point in self.plotter.camera_position
+            ],
+            "parallel_scale": float(self.plotter.camera.parallel_scale),
+            "view_angle": float(self.plotter.camera.view_angle),
+        }
+
+    def _restore_camera_state(self, state: Dict[str, Any]) -> None:
+        """Restore camera pose and zoom after dynamic actor replacement."""
+        self.plotter.camera_position = state["camera_position"]
+        self.plotter.camera.parallel_scale = state["parallel_scale"]
+        self.plotter.camera.view_angle = state["view_angle"]
+        # Dynamic actor bounds can change after route withdrawal/recovery.
+        # Update clipping only; never refit/reset the manually selected view.
+        self.plotter.reset_camera_clipping_range()
+
+    def fit_initial_camera(self) -> None:
+        """Fit the completed scene once, without taking over later interaction."""
+        self.plotter.view_isometric(render=False)
+        self.plotter.reset_camera(render=False)
+        self.plotter.reset_camera_clipping_range()
+        self._scene_camera_initialized = True
+
+    def _dynamic_camera_state(self) -> Optional[Dict[str, Any]]:
+        """Capture a stable manual view only when redraws are user-driven."""
+        if self.preserve_camera_on_refresh and self._scene_camera_initialized:
+            return self._capture_camera_state()
+        return None
+
+    def _finish_dynamic_refresh(self, camera_state: Optional[Dict[str, Any]]) -> None:
+        if not self._scene_camera_initialized:
+            # All static and first dynamic actors are now available.
+            self.fit_initial_camera()
+        elif camera_state is not None:
+            self._restore_camera_state(camera_state)
+        else:
+            # Qt timer mode: never write camera_position while the user moves it.
+            self.plotter.reset_camera_clipping_range()
+        self.plotter.render()
 
     def _selected_edge(self) -> Tuple[str, str]:
         return self.edge_list[self.selected_edge_index]
@@ -1029,12 +1086,23 @@ class InteractiveBuildingViewer:
     def _highlight_selected_node(self, node: str) -> None:
         if self.selected_node_actor is not None:
             self.plotter.remove_actor(self.selected_node_actor)
-        self.selected_node_actor = self.plotter.add_mesh(pv.Sphere(radius=0.7, center=self.G.nodes[node]["position"]), color="yellow", pickable=False)
+        self.selected_node_actor = self.plotter.add_mesh(
+            pv.Sphere(radius=0.7, center=self.G.nodes[node]["position"]),
+            color="yellow",
+            pickable=False,
+            reset_camera=False,
+        )
 
     def _highlight_selected_edge(self, u: str, v: str) -> None:
         if self.selected_edge_actor is not None:
             self.plotter.remove_actor(self.selected_edge_actor)
-        self.selected_edge_actor = self.plotter.add_mesh(pv.Line(self.G.nodes[u]["position"], self.G.nodes[v]["position"]), color="orange", line_width=10, pickable=False)
+        self.selected_edge_actor = self.plotter.add_mesh(
+            pv.Line(self.G.nodes[u]["position"], self.G.nodes[v]["position"]),
+            color="orange",
+            line_width=10,
+            pickable=False,
+            reset_camera=False,
+        )
 
     def _draw_dynamic(self) -> None:
         if self.path_actor is not None:
@@ -1042,13 +1110,28 @@ class InteractiveBuildingViewer:
             self.path_actor = None
         if self.current_path and len(self.current_path) >= 2:
             points = np.array([self.G.nodes[n]["position"] for n in self.current_path])
-            self.path_actor = self.plotter.add_mesh(pv.lines_from_points(points), color="lime", line_width=9, pickable=False)
+            self.path_actor = self.plotter.add_mesh(
+                pv.lines_from_points(points),
+                color="lime",
+                line_width=9,
+                pickable=False,
+                reset_camera=False,
+            )
         if self.heatmap_actor is not None:
             self.plotter.remove_actor(self.heatmap_actor)
         values = [100.0 if np.isinf(self.strategy().get_value(n)) else self.strategy().get_value(n) for n in self.G.nodes]
         pdata = pv.PolyData(np.array([self.G.nodes[n]["position"] for n in self.G.nodes]))
         pdata["value"] = np.array(values)
-        self.heatmap_actor = self.plotter.add_mesh(pdata, scalars="value", point_size=25, render_points_as_spheres=True, cmap="coolwarm", scalar_bar_args={"title": "Route cost"}, pickable=False)
+        self.heatmap_actor = self.plotter.add_mesh(
+            pdata,
+            scalars="value",
+            point_size=25,
+            render_points_as_spheres=True,
+            cmap="coolwarm",
+            scalar_bar_args={"title": "Route cost"},
+            pickable=False,
+            reset_camera=False,
+        )
         for actor in self.policy_arrow_actors + self.device_arrow_actors:
             self.plotter.remove_actor(actor)
         self.policy_arrow_actors.clear()
@@ -1060,10 +1143,28 @@ class InteractiveBuildingViewer:
                     direction = self.G.nodes[nxt]["position"] - self.G.nodes[node]["position"]
                     norm = np.linalg.norm(direction)
                     if norm > 1e-9:
-                        self.policy_arrow_actors.append(self.plotter.add_mesh(pv.Arrow(start=self.G.nodes[node]["position"], direction=direction / norm, scale=1.1), color="royalblue", pickable=False))
+                        self.policy_arrow_actors.append(
+                            self.plotter.add_mesh(
+                                pv.Arrow(
+                                    start=self.G.nodes[node]["position"],
+                                    direction=direction / norm,
+                                    scale=1.1,
+                                ),
+                                color="royalblue",
+                                pickable=False,
+                                reset_camera=False,
+                            )
+                        )
         else:
             for start, direction in self.strategy().device_policy_arrows():
-                self.device_arrow_actors.append(self.plotter.add_mesh(pv.Arrow(start=start, direction=direction, scale=1.0), color="darkorange", pickable=False))
+                self.device_arrow_actors.append(
+                    self.plotter.add_mesh(
+                        pv.Arrow(start=start, direction=direction, scale=1.1),
+                        color="darkorange",
+                        pickable=False,
+                        reset_camera=False,
+                    )
+                )
         path_edges = {canonical_edge(self.current_path[i], self.current_path[i+1]) for i in range(len(self.current_path or []) - 1)}
         for edge, actor in self.edge_actors.items():
             actor.prop.line_width = 4
@@ -1118,16 +1219,18 @@ class InteractiveBuildingViewer:
         self.refresh_after_incremental_update()
 
     def refresh_after_incremental_update(self) -> None:
+        camera_state = self._dynamic_camera_state()
         self._recompute_path()
         self._draw_dynamic()
         self._update_text()
-        self.plotter.render()
+        self._finish_dynamic_refresh(camera_state)
 
     def refresh_path_only(self) -> None:
+        camera_state = self._dynamic_camera_state()
         self._recompute_path()
         self._draw_dynamic()
         self._update_text()
-        self.plotter.render()
+        self._finish_dynamic_refresh(camera_state)
 
     def print_device_table(self) -> None:
         strategy = self.strategy()
@@ -1148,17 +1251,30 @@ class InteractiveBuildingViewer:
         else:
             print(f"\nDisplayed route: {' -> '.join(self.current_path or [])} | cost={self.field_cost:.2f} | exact={finite_text(self.exact_cost if self.exact_cost is not None else INF, 2)}\n")
 
-    def build_scene(self) -> None:
+    def build_scene(self, *, enable_picking: bool = True) -> None:
+        """Build the 3D scene.
+
+        Interactive picking is enabled for the manual simulator, but can be
+        disabled for automated screen-recording scenarios.  The picker binds
+        mouse interaction that otherwise belongs to camera navigation.
+        """
         self._add_static_scene()
         self._add_ui()
         self.plotter.show_grid()
-        self.plotter.enable_surface_point_picking(callback=self._on_point_picked, show_point=True, clear_on_no_selection=True, font_size=0)
+        if enable_picking:
+            self.plotter.enable_surface_point_picking(
+                callback=self._on_point_picked,
+                show_point=True,
+                clear_on_no_selection=True,
+                font_size=0,
+                left_clicking=False,
+            )
         self.refresh_full()
         self._highlight_selected_node(self.current_start)
         self._highlight_selected_edge(*self._selected_edge())
 
     def show(self) -> None:
-        self.build_scene()
+        self.build_scene(enable_picking=True)
         self.plotter.show()
 
 
