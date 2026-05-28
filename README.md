@@ -1,6 +1,8 @@
 # Navilight
 
-![](navilight.gif)
+<p align="center">
+  <img src="assets/navilight.gif" alt="Navilight dynamic indoor evacuation guidance simulation" width="720">
+</p>
 
 **Navilight** is a proof-of-concept simulator for **distributed adaptive evacuation guidance** in a smart building.
 
