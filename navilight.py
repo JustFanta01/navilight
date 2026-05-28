@@ -4,21 +4,25 @@ NAVILIGHT — DISTRIBUTED ADAPTIVE EVACUATION GUIDANCE POC
 ============================================================
 
 Navilight models guidance devices installed at discrete routing waypoints in a
-building.  Each device selects the direction it displays using only:
+building.  This file exposes three routing views over the same physical world:
 
-- the state of movement links incident to its controlled waypoint;
-- route advertisements received from devices at adjacent waypoints.
-
-The distributed strategy is a local path-vector protocol.  It deliberately
-avoids a replicated global value table inside each device.  A centralized
-shortest-path computation is retained only as an observer-side diagnostic
-oracle for the UI; it is never used to decide actuator arrows.
+- ``centralized-bellman-oracle``: a global reference computation used for
+  diagnostics and comparison;
+- ``distributed-path-vector``: the original working local-route protocol, in
+  which an agent selects only route advertisements from physically adjacent
+  waypoints;
+- ``distributed-link-state``: each agent owns a static copy of the movement
+  topology and gossips dynamic link/device-fault events over the radio graph.
+  Each local view produces a deterministic complete policy: when two live
+  devices have learned the same events, their arrows agree on every shared
+  route suffix, including equal-cost alternatives.
 
 Model layers:
 
 - Movement graph G_M = (V, A): physical routes between routing waypoints.
-- Communication graph G_C = (D, L): radio/data connectivity between devices.
-- Route agent at each controlled waypoint: local route selection and gossip.
+- Communication graph G_C = (D, L): radio/data connectivity between devices;
+  a radio link transports information and is never itself a walking step.
+- Routing strategies: independent state owned outside of G_M.
 - Viewer: interaction, rendering and optional oracle comparison.
 
 A corridor light should be represented by adding a routing waypoint at its
@@ -122,8 +126,6 @@ class BuildingGeometry:
             kind=kind,
             position=np.array(position, dtype=float),
             label=label or node_id,
-            value=INF,
-            next=None,
             **attrs,
         )
 
@@ -313,21 +315,55 @@ class MovementGraphController:
 # ============================================================
 
 class CommunicationEngine:
-    """Radio/data connectivity between physical guidance devices."""
+    """Static radio topology plus ground-truth device availability.
+
+    ``communication_graph`` describes which installed devices can exchange
+    packets when both are alive.  Dynamic failures do not delete graph nodes:
+    strategies must learn them through status events, exactly as they learn
+    remote blocked links.
+    """
 
     def __init__(self, devices: Dict[str, GuidanceDevice]) -> None:
         self.devices = devices
         self.communication_graph = nx.Graph()
-        self.node_to_device: Dict[str, str] = {}
+        # Movement nodes and physical devices intentionally keep distinct IDs.
+        self.device_for_node: Dict[str, str] = {}
+        self._failed_devices: Dict[str, bool] = {name: False for name in devices}
+        self._device_versions: Dict[str, int] = {name: 0 for name in devices}
         self.rebuild()
+
+    def is_device_failed(self, device_name: str) -> bool:
+        return bool(self._failed_devices.get(device_name, False))
+
+    def set_device_failed(self, device_name: str, failed: bool = True) -> bool:
+        if device_name not in self.devices:
+            raise KeyError(f"Unknown guidance device: {device_name}")
+        if self.is_device_failed(device_name) == failed:
+            return False
+        self._failed_devices[device_name] = failed
+        self._device_versions[device_name] += 1
+        return True
+
+    def toggle_device_failed(self, device_name: str) -> bool:
+        return self.set_device_failed(device_name, not self.is_device_failed(device_name))
+
+    def device_event(self, device_name: str) -> Tuple[bool, int]:
+        return self.is_device_failed(device_name), int(self._device_versions[device_name])
+
+    def reset_device_failures(self) -> List[str]:
+        recovered: List[str] = []
+        for device_name in self.devices:
+            if self.set_device_failed(device_name, False):
+                recovered.append(device_name)
+        return recovered
 
     def rebuild(self) -> None:
         graph = nx.Graph()
-        self.node_to_device.clear()
+        self.device_for_node.clear()
         for name, device in self.devices.items():
-            if device.controlled_node in self.node_to_device:
+            if device.controlled_node in self.device_for_node:
                 raise RuntimeError(f"Multiple devices control node {device.controlled_node}")
-            self.node_to_device[device.controlled_node] = name
+            self.device_for_node[device.controlled_node] = name
             graph.add_node(name, position=np.array(device.position), controlled_node=device.controlled_node)
         names = list(self.devices)
         for i, left in enumerate(names):
@@ -345,12 +381,52 @@ class CommunicationEngine:
             components = [sorted(c) for c in nx.connected_components(self.communication_graph)]
             raise RuntimeError(f"Communication graph is disconnected: {components}")
 
+    def validate_single_device_failure_tolerance(self) -> None:
+        """Require radio redundancy against any single guidance-device failure.
+
+        This is a deployment-time validation, not a promise under arbitrary
+        simultaneous failures.  If later failures partition the live radio
+        graph, the application reports a runtime warning because global event
+        agreement can no longer be guaranteed.
+        """
+        if self.communication_graph.number_of_nodes() < 3:
+            raise RuntimeError("At least three devices are required for single-failure radio redundancy.")
+        articulation_points = sorted(nx.articulation_points(self.communication_graph))
+        if articulation_points:
+            raise RuntimeError(
+                "Radio deployment is not tolerant to one device failure. "
+                f"Critical devices: {articulation_points}"
+            )
+
+    def live_communication_graph(self) -> nx.Graph:
+        live_devices = [
+            name for name in self.communication_graph.nodes
+            if not self.is_device_failed(name)
+        ]
+        return self.communication_graph.subgraph(live_devices).copy()
+
+    def live_components(self) -> List[Set[str]]:
+        live_graph = self.live_communication_graph()
+        if live_graph.number_of_nodes() == 0:
+            return []
+        return [set(component) for component in nx.connected_components(live_graph)]
+
+    def live_partition_warning(self) -> Optional[str]:
+        components = self.live_components()
+        if len(components) <= 1:
+            return None
+        sizes = sorted((len(component) for component in components), reverse=True)
+        return (
+            f"live radio graph partitioned into {len(components)} components "
+            f"(sizes={sizes}); global event agreement is not guaranteed"
+        )
+
     def validate_movement_adjacency_links(self, movement_graph: nx.Graph) -> None:
         """Every physical one-hop routing candidate must have a data link."""
         missing: List[EdgeId] = []
         for u, v in movement_graph.edges:
-            du = self.node_to_device.get(u)
-            dv = self.node_to_device.get(v)
+            du = self.device_for_node.get(u)
+            dv = self.device_for_node.get(v)
             if du is None or dv is None or not self.communication_graph.has_edge(du, dv):
                 missing.append(canonical_edge(u, v))
         if missing:
@@ -392,6 +468,10 @@ class RoutingStrategy(ABC):
 
     def on_graph_reset(self, changed_edges: Iterable[EdgeId]) -> None:
         self.recompute()
+
+    def on_device_status_changed(self, device_name: str) -> None:
+        """Optional hook for strategies that model failed guidance hardware."""
+        return
 
     def device_policy_arrows(self) -> List[Tuple[np.ndarray, np.ndarray]]:
         return []
@@ -508,11 +588,16 @@ class RouteAgentState:
 
 
 class DistributedPathVectorEngine:
-    r"""Local, asynchronous, loop-resistant routing protocol.
+    r"""Original local path-vector routing protocol, preserved for comparison.
 
     Each agent controls one routing waypoint x.  It knows only incident
-    physical links and advertisements received from neighbouring waypoint
-    agents.  For a traversable local link (x, y), a candidate is:
+    physical links and route advertisements received over the radio graph.
+    An advertisement may be used as a routing candidate only when its sender
+    controls a physically adjacent waypoint, because its semantics are
+    "choose me as the first movement hop".  Remote hazard/fault dissemination
+    is instead implemented by ``DistributedLinkStateStrategy`` below.
+
+    For a traversable local link (x, y), a candidate is:
 
         c(x,y) + A_y.cost
 
@@ -534,7 +619,7 @@ class DistributedPathVectorEngine:
         self.communication = communication
         self.C = communication.communication_graph
         self.devices = devices
-        self.node_to_device = dict(communication.node_to_device)
+        self.device_for_node = dict(communication.device_for_node)
         self.states: Dict[str, RouteAgentState] = {}
         self.tick_count = 0
         self.last_messages_sent = 0
@@ -582,8 +667,10 @@ class DistributedPathVectorEngine:
         while state.inbox:
             advertisement = state.inbox.popleft()
             sender_node = advertisement.sender_node
-            # Extra radio neighbours are allowed, but only a physically adjacent
-            # waypoint can be used as a first routing hop.
+            # This is a route advertisement, not a general hazard report: its
+            # sender can be chosen only when it is a physical first hop.
+            # Link-state/fault events from arbitrary radio peers are handled by
+            # DistributedLinkStateStrategy.
             if sender_node not in state.links:
                 continue
             previous = state.received_routes.get(sender_node)
@@ -626,7 +713,7 @@ class DistributedPathVectorEngine:
     def observe_incident_edge_change(self, u: str, v: str, blocked: bool, version: int) -> None:
         """Deliver a physical observation only to the two endpoint agents."""
         for node, neighbor in ((u, v), (v, u)):
-            device_name = self.node_to_device[node]
+            device_name = self.device_for_node[node]
             state = self.states[device_name]
             current = state.links.get(neighbor)
             if current is None:
@@ -661,7 +748,7 @@ class DistributedPathVectorEngine:
         raise RuntimeError("Path-vector routing did not settle within max_ticks.")
 
     def route_for_node(self, node: str) -> RouteAdvertisement:
-        return self.states[self.node_to_device[node]].route
+        return self.states[self.device_for_node[node]].route
 
     def next_for_node(self, node: str) -> Optional[str]:
         route = self.route_for_node(node)
@@ -670,7 +757,7 @@ class DistributedPathVectorEngine:
     def route_is_structurally_safe(self, node: str) -> bool:
         """Check the locally selected path-vector proof, not a global search."""
         route = self.route_for_node(node)
-        state = self.states[self.node_to_device[node]]
+        state = self.states[self.device_for_node[node]]
         if state.is_exit:
             return route.reachable and route.path == (node,)
         return (
@@ -762,33 +849,23 @@ class DistributedPathVectorStrategy(RoutingStrategy):
 
     def recompute(self) -> None:
         self.engine.run_until_quiet(self.bootstrap_ticks)
-        self._publish_for_visualization()
 
     def on_edge_status_changed(self, u: str, v: str) -> None:
         blocked, version = self.controller.edge_event(u, v)
         self.engine.observe_incident_edge_change(u, v, blocked, version)
         self.engine.tick(self.ticks_per_event)
-        self._publish_for_visualization()
 
     def on_graph_reset(self, changed_edges: Iterable[EdgeId]) -> None:
         for u, v in changed_edges:
             blocked, version = self.controller.edge_event(u, v)
             self.engine.observe_incident_edge_change(u, v, blocked, version)
         self.engine.run_until_quiet(self.bootstrap_ticks)
-        self._publish_for_visualization()
 
     def tick(self, n: int = 1) -> None:
         self.engine.tick(n)
-        self._publish_for_visualization()
 
     def settle_until_quiet(self, max_ticks: int = 500) -> None:
         self.engine.run_until_quiet(max_ticks)
-        self._publish_for_visualization()
-
-    def _publish_for_visualization(self) -> None:
-        # The viewer reads this strategy through get_value()/get_next().
-        # Do not publish into shared graph attributes: another strategy may be active.
-        return
 
     def get_value(self, node: str) -> float:
         return self.engine.route_for_node(node).cost
@@ -842,6 +919,673 @@ class DistributedPathVectorStrategy(RoutingStrategy):
         return self.diagnostics.device_table_rows()
 
 
+# ============================================================
+# DISTRIBUTED LINK-STATE ROUTING WITH STATIC TOPOLOGY
+# ============================================================
+
+@dataclass(frozen=True)
+class ComputedRoute:
+    """A locally computed physical route from one controlled waypoint."""
+
+    reachable: bool
+    exit_id: Optional[str]
+    cost: float
+    path: Tuple[str, ...]
+
+    @classmethod
+    def unreachable(cls) -> "ComputedRoute":
+        return cls(False, None, INF, tuple())
+
+
+@dataclass(frozen=True)
+class LinkStateAdvertisement:
+    """Dynamic status of one physical movement link, floodable over radio.
+
+    ``conflict`` records that two observations with the same version disagree.
+    In that case the merged state is always conservative: ``blocked=True``
+    wins until a strictly newer version supersedes the conflict.
+    """
+
+    reporter_device: str
+    edge: EdgeId
+    blocked: bool
+    version: int
+    conflict: bool = False
+
+
+@dataclass(frozen=True)
+class DeviceStatusAdvertisement:
+    """Dynamic availability status of one guidance device.
+
+    A failed device cannot reliably announce its own failure.  In this POC the
+    event is injected at its live radio neighbours, modelling heartbeat timeout
+    detection.  Recovery is injected at the recovered device and its peers.
+    Conflicting observations at the same version resolve safety-first to
+    ``failed=True`` until a newer observation is received.
+    """
+
+    reporter_device: str
+    subject_device: str
+    failed: bool
+    version: int
+    conflict: bool = False
+
+
+@dataclass
+class LinkStateAgentState:
+    device_name: str
+    controlled_node: str
+    static_graph: nx.Graph
+    known_links: Dict[EdgeId, LinkStateAdvertisement]
+    known_devices: Dict[str, DeviceStatusAdvertisement]
+    policy_values: Dict[str, float] = field(default_factory=dict)
+    policy_next: Dict[str, Optional[str]] = field(default_factory=dict)
+    policy_exits: Dict[str, Optional[str]] = field(default_factory=dict)
+    conflicting_links: Set[EdgeId] = field(default_factory=set)
+    conflicting_devices: Set[str] = field(default_factory=set)
+    route: ComputedRoute = field(default_factory=ComputedRoute.unreachable)
+    inbox: Deque[Any] = field(default_factory=deque)
+    revision: int = 0
+
+
+class DistributedLinkStateEngine:
+    """Radio-flooded dynamic state plus deterministic local physical policy.
+
+    Every installed device owns a static copy of the physical movement graph.
+    Radio links carry dynamic *events*, never walking decisions: blocked or
+    reopened movement edges and failed or recovered devices.  Each live device
+    applies the events it has learned to its static topology and computes a
+    complete local value/next-hop policy.
+
+    Policy tie-break rule, applied identically by every agent with the same
+    local view:
+
+    1. choose minimum total movement cost to an exit;
+    2. among equal-cost continuations, choose the lexicographically smallest
+       downstream exit identifier;
+    3. among continuations to that exit, choose the lexicographically smallest
+       physical next-hop identifier.
+
+    Since all edge costs are positive, each chosen hop strictly decreases the
+    remaining value.  The policy is therefore cycle-free, and agents that have
+    learned the same events compute suffix-consistent arrows even in ties.
+
+    ``self.G`` and ``CommunicationEngine`` remain observer/environment truth
+    in this single-process demo; route selection reads only each state's static
+    graph and learned dynamic advertisements.
+    """
+
+    def __init__(
+        self,
+        movement_graph: nx.Graph,
+        communication: CommunicationEngine,
+        devices: Dict[str, GuidanceDevice],
+    ) -> None:
+        self.G = movement_graph
+        self.communication = communication
+        self.C = communication.communication_graph
+        self.devices = devices
+        self.device_for_node = dict(communication.device_for_node)
+        self.states: Dict[str, LinkStateAgentState] = {}
+        self.tick_count = 0
+        self.last_messages_sent = 0
+        self.last_route_changes = 0
+        self.last_events_accepted = 0
+        self.initialize()
+
+    def _new_static_topology_copy(self) -> nx.Graph:
+        graph = nx.Graph()
+        for node, attrs in self.G.nodes(data=True):
+            graph.add_node(node, kind=attrs["kind"], label=attrs.get("label", node))
+        for u, v, attrs in self.G.edges(data=True):
+            graph.add_edge(u, v, base_weight=float(attrs["base_weight"]))
+        return nx.freeze(graph)
+
+    def initialize(self) -> None:
+        """Provision devices with topology and the deployment-time baseline.
+
+        It is legitimate for all devices to know the initial all-clear state at
+        installation time. Subsequent mutations are learned only through local
+        observation injection and radio dissemination.
+        """
+        self.states.clear()
+        initial_links = {
+            canonical_edge(u, v): LinkStateAdvertisement(
+                reporter_device="deployment",
+                edge=canonical_edge(u, v),
+                blocked=bool(attrs.get("blocked", False)),
+                version=int(attrs.get("version", 0)),
+            )
+            for u, v, attrs in self.G.edges(data=True)
+        }
+        initial_devices = {
+            name: DeviceStatusAdvertisement(
+                reporter_device="deployment",
+                subject_device=name,
+                failed=self.communication.is_device_failed(name),
+                version=self.communication.device_event(name)[1],
+            )
+            for name in self.devices
+        }
+        for device_name, device in self.devices.items():
+            state = LinkStateAgentState(
+                device_name=device_name,
+                controlled_node=device.controlled_node,
+                static_graph=self._new_static_topology_copy(),
+                known_links=dict(initial_links),
+                known_devices=dict(initial_devices),
+            )
+            state.route = self._recompute_policy(state)
+            self.states[device_name] = state
+
+    def _accept_link_event(
+        self,
+        state: LinkStateAgentState,
+        event: LinkStateAdvertisement,
+    ) -> Optional[LinkStateAdvertisement]:
+        previous = state.known_links.get(event.edge)
+        if previous is None or event.version > previous.version:
+            state.known_links[event.edge] = event
+            if event.conflict:
+                state.conflicting_links.add(event.edge)
+            else:
+                state.conflicting_links.discard(event.edge)
+            return event
+        if event.version < previous.version:
+            return None
+
+        # Equal-version reports should agree.  Any contradiction resolves to
+        # the safer state and is itself flooded so remote agents learn it too.
+        conflict = previous.conflict or event.conflict or previous.blocked != event.blocked
+        blocked = previous.blocked or event.blocked if conflict else previous.blocked
+        if not conflict:
+            return None
+        resolved = LinkStateAdvertisement(
+            reporter_device="conflict-resolution",
+            edge=event.edge,
+            blocked=blocked,
+            version=event.version,
+            conflict=True,
+        )
+        if previous == resolved:
+            return None
+        state.known_links[event.edge] = resolved
+        state.conflicting_links.add(event.edge)
+        return resolved
+
+    def _accept_device_event(
+        self,
+        state: LinkStateAgentState,
+        event: DeviceStatusAdvertisement,
+    ) -> Optional[DeviceStatusAdvertisement]:
+        previous = state.known_devices.get(event.subject_device)
+        if previous is None or event.version > previous.version:
+            state.known_devices[event.subject_device] = event
+            if event.conflict:
+                state.conflicting_devices.add(event.subject_device)
+            else:
+                state.conflicting_devices.discard(event.subject_device)
+            return event
+        if event.version < previous.version:
+            return None
+        conflict = previous.conflict or event.conflict or previous.failed != event.failed
+        failed = previous.failed or event.failed if conflict else previous.failed
+        if not conflict:
+            return None
+        resolved = DeviceStatusAdvertisement(
+            reporter_device="conflict-resolution",
+            subject_device=event.subject_device,
+            failed=failed,
+            version=event.version,
+            conflict=True,
+        )
+        if previous == resolved:
+            return None
+        state.known_devices[event.subject_device] = resolved
+        state.conflicting_devices.add(event.subject_device)
+        return resolved
+
+    def _accept_event(self, state: LinkStateAgentState, event: Any) -> Optional[Any]:
+        if isinstance(event, LinkStateAdvertisement):
+            return self._accept_link_event(state, event)
+        if isinstance(event, DeviceStatusAdvertisement):
+            return self._accept_device_event(state, event)
+        raise TypeError(f"Unsupported link-state event: {type(event)!r}")
+
+    def _usable_graph_from_local_view(self, state: LinkStateAgentState) -> nx.Graph:
+        usable = nx.Graph()
+        failed_nodes = {
+            self.devices[name].controlled_node
+            for name, advertisement in state.known_devices.items()
+            if advertisement.failed
+        }
+        for node, attrs in state.static_graph.nodes(data=True):
+            if node not in failed_nodes:
+                usable.add_node(node, **attrs)
+        for u, v, attrs in state.static_graph.edges(data=True):
+            event = state.known_links[canonical_edge(u, v)]
+            if not event.blocked and u in usable and v in usable:
+                usable.add_edge(u, v, weight=float(attrs["base_weight"]))
+        return usable
+
+    def _recompute_policy(self, state: LinkStateAgentState) -> ComputedRoute:
+        """Build a deterministic full policy from one agent's learned view."""
+        usable = self._usable_graph_from_local_view(state)
+        nodes = list(state.static_graph.nodes)
+        values: Dict[str, float] = {node: INF for node in nodes}
+        next_hops: Dict[str, Optional[str]] = {node: None for node in nodes}
+        exit_ids: Dict[str, Optional[str]] = {node: None for node in nodes}
+        exits = sorted(node for node, attrs in usable.nodes(data=True) if attrs["kind"] == "exit")
+
+        if exits:
+            distances = nx.multi_source_dijkstra_path_length(usable, exits, weight="weight")
+            for node, distance in distances.items():
+                values[node] = float(distance)
+            for exit_node in exits:
+                exit_ids[exit_node] = exit_node
+            ordered_nodes = sorted(
+                (node for node in distances if node not in exits),
+                key=lambda node: (values[node], node),
+            )
+            for node in ordered_nodes:
+                candidates: List[Tuple[str, str]] = []
+                for neighbor in usable.neighbors(node):
+                    edge_cost = float(usable[node][neighbor]["weight"])
+                    if np.isinf(values[neighbor]):
+                        continue
+                    if not np.isclose(edge_cost + values[neighbor], values[node], rtol=0.0, atol=1e-9):
+                        continue
+                    downstream_exit = exit_ids[neighbor]
+                    if downstream_exit is not None:
+                        candidates.append((downstream_exit, neighbor))
+                if candidates:
+                    chosen_exit, chosen_next = min(candidates)
+                    exit_ids[node] = chosen_exit
+                    next_hops[node] = chosen_next
+
+        state.policy_values = values
+        state.policy_next = next_hops
+        state.policy_exits = exit_ids
+        return self._route_from_policy(state, state.controlled_node)
+
+    def _route_from_policy(self, state: LinkStateAgentState, start: str) -> ComputedRoute:
+        cost = state.policy_values.get(start, INF)
+        exit_id = state.policy_exits.get(start)
+        if np.isinf(cost) or exit_id is None:
+            return ComputedRoute.unreachable()
+        path: List[str] = [start]
+        visited: Set[str] = {start}
+        current = start
+        while current != exit_id:
+            nxt = state.policy_next.get(current)
+            if nxt is None:
+                raise RuntimeError(f"Incomplete link-state policy at {current} in device {state.device_name}.")
+            if nxt in visited:
+                raise RuntimeError(f"Cycle in link-state policy owned by {state.device_name}.")
+            if state.policy_values[nxt] >= state.policy_values[current] - 1e-9:
+                raise RuntimeError(f"Non-descending link-state policy value at {current} -> {nxt}.")
+            path.append(nxt)
+            visited.add(nxt)
+            current = nxt
+        return ComputedRoute(True, exit_id, float(cost), tuple(path))
+
+    def observe_incident_edge_change(self, u: str, v: str, blocked: bool, version: int) -> None:
+        """Inject a physical edge observation at live devices on its endpoints."""
+        edge = canonical_edge(u, v)
+        observers = [self.device_for_node[u], self.device_for_node[v]]
+        for reporter in observers:
+            if self.communication.is_device_failed(reporter):
+                continue
+            self.states[reporter].inbox.append(LinkStateAdvertisement(reporter, edge, blocked, version))
+
+    def observe_device_status_change(self, device_name: str, failed: bool, version: int) -> None:
+        """Model heartbeat-based failure detection and recovery resynchronization.
+
+        Live neighbours report failure after a heartbeat timeout.  When a
+        device returns, it must not immediately route using the stale view it
+        retained while offline: live peers seed its inbox with their known
+        dynamic databases, modelling a link-state synchronization exchange.
+        """
+        reporters = [
+            peer for peer in self.C.neighbors(device_name)
+            if not self.communication.is_device_failed(peer)
+        ]
+        status_events = [
+            DeviceStatusAdvertisement(reporter, device_name, failed, version)
+            for reporter in reporters
+        ]
+        for reporter, event in zip(reporters, status_events):
+            self.states[reporter].inbox.append(event)
+        if failed:
+            self.states[device_name].inbox.clear()
+            return
+
+        recovered = self.states[device_name]
+        recovered.inbox.append(DeviceStatusAdvertisement(device_name, device_name, False, version))
+        for peer in reporters:
+            peer_state = self.states[peer]
+            recovered.inbox.extend(peer_state.known_links.values())
+            recovered.inbox.extend(peer_state.known_devices.values())
+
+    def _broadcast(self, sender: str, events: Iterable[Any]) -> int:
+        if self.communication.is_device_failed(sender):
+            return 0
+        sent = 0
+        for event in events:
+            for target in self.C.neighbors(sender):
+                if self.communication.is_device_failed(target):
+                    continue
+                self.states[target].inbox.append(event)
+                sent += 1
+        return sent
+
+    def tick(self, n: int = 1) -> None:
+        for _ in range(n):
+            self.tick_count += 1
+            accepted_by_sender: Dict[str, List[Any]] = {}
+            changes = 0
+            accepted_count = 0
+            for device_name, state in self.states.items():
+                if self.communication.is_device_failed(device_name):
+                    state.inbox.clear()
+                    continue
+                accepted: List[Any] = []
+                while state.inbox:
+                    event = state.inbox.popleft()
+                    accepted_event = self._accept_event(state, event)
+                    if accepted_event is not None:
+                        accepted.append(accepted_event)
+                if accepted:
+                    accepted_by_sender[device_name] = accepted
+                    accepted_count += len(accepted)
+                    selected = self._recompute_policy(state)
+                    if selected != state.route:
+                        state.route = selected
+                        state.revision += 1
+                        changes += 1
+            sent = sum(self._broadcast(sender, events) for sender, events in accepted_by_sender.items())
+            self.last_events_accepted = accepted_count
+            self.last_route_changes = changes
+            self.last_messages_sent = sent
+
+    def pending_work(self) -> int:
+        return sum(
+            len(state.inbox)
+            for name, state in self.states.items()
+            if not self.communication.is_device_failed(name)
+        )
+
+    def run_until_quiet(self, max_ticks: int = 500) -> None:
+        for _ in range(max_ticks):
+            if self.pending_work() == 0:
+                return
+            self.tick(1)
+        raise RuntimeError("Distributed link-state gossip did not settle within max_ticks.")
+
+    def route_for_node(self, node: str) -> ComputedRoute:
+        return self.states[self.device_for_node[node]].route
+
+    def next_for_node(self, node: str) -> Optional[str]:
+        route = self.route_for_node(node)
+        return route.path[1] if route.reachable and len(route.path) >= 2 else None
+
+    def route_is_locally_structurally_safe(self, node: str) -> bool:
+        route = self.route_for_node(node)
+        if not route.reachable:
+            return False
+        state = self.states[self.device_for_node[node]]
+        if not route.path or route.path[0] != node or route.path[-1] != route.exit_id:
+            return False
+        if len(set(route.path)) != len(route.path):
+            return False
+        usable = self._usable_graph_from_local_view(state)
+        return all(usable.has_edge(route.path[i], route.path[i + 1]) for i in range(len(route.path) - 1))
+
+    def known_conflict_counts(self) -> Tuple[int, int]:
+        link_conflicts: Set[EdgeId] = set()
+        device_conflicts: Set[str] = set()
+        for device_name, state in self.states.items():
+            if self.communication.is_device_failed(device_name):
+                continue
+            link_conflicts.update(state.conflicting_links)
+            device_conflicts.update(state.conflicting_devices)
+        return len(link_conflicts), len(device_conflicts)
+
+    def handoff_inconsistencies(self) -> int:
+        """Count arrows whose downstream device advertises a different suffix.
+
+        In a settled, connected radio graph this value must be zero because all
+        live agents have the same local view and deterministic policy. During
+        event dissemination it intentionally exposes temporary disagreement.
+        """
+        inconsistent = 0
+        for node in self.G.nodes:
+            upstream_device = self.device_for_node[node]
+            if self.communication.is_device_failed(upstream_device):
+                continue
+            route = self.states[upstream_device].route
+            if not route.reachable or len(route.path) < 2:
+                continue
+            next_node = route.path[1]
+            next_device = self.device_for_node[next_node]
+            if self.communication.is_device_failed(next_device):
+                inconsistent += 1
+                continue
+            downstream_route = self.states[next_device].route
+            if not downstream_route.reachable or route.path[1:] != downstream_route.path:
+                inconsistent += 1
+        return inconsistent
+
+
+class LinkStateDiagnostics:
+    """Observer-only comparison against current physical/failure ground truth."""
+
+    def __init__(
+        self,
+        engine: DistributedLinkStateEngine,
+        controller: MovementGraphController,
+        communication: CommunicationEngine,
+    ) -> None:
+        self.engine = engine
+        self.G = engine.G
+        self.controller = controller
+        self.communication = communication
+
+    def _ground_truth_graph(self) -> nx.Graph:
+        usable = nx.Graph()
+        failed_nodes = {
+            device.controlled_node for name, device in self.engine.devices.items()
+            if self.communication.is_device_failed(name)
+        }
+        for node, attrs in self.G.nodes(data=True):
+            if node not in failed_nodes:
+                usable.add_node(node, **attrs)
+        for u, v, attrs in self.G.edges(data=True):
+            if not attrs.get("blocked", False) and u in usable and v in usable:
+                usable.add_edge(u, v, weight=float(attrs["base_weight"]))
+        return usable
+
+    def exact_cost(self, node: str) -> float:
+        usable = self._ground_truth_graph()
+        if node not in usable:
+            return INF
+        exits = [n for n, attrs in usable.nodes(data=True) if attrs["kind"] == "exit"]
+        costs: List[float] = []
+        for exit_node in exits:
+            try:
+                costs.append(float(nx.shortest_path_length(usable, node, exit_node, weight="weight")))
+            except nx.NetworkXNoPath:
+                pass
+        return min(costs) if costs else INF
+
+    def route_is_ground_truth_safe(self, node: str) -> bool:
+        route = self.engine.route_for_node(node)
+        if not route.reachable:
+            return False
+        usable = self._ground_truth_graph()
+        return (
+            node in usable
+            and route.path[0] == node
+            and len(set(route.path)) == len(route.path)
+            and all(usable.has_edge(route.path[i], route.path[i + 1]) for i in range(len(route.path) - 1))
+        )
+
+    def global_summary(self) -> Dict[str, float]:
+        wrong, unsafe, max_error = 0, 0, 0.0
+        for node in self.G.nodes:
+            device_name = self.engine.device_for_node[node]
+            failed = self.communication.is_device_failed(device_name)
+            distributed = INF if failed else self.engine.route_for_node(node).cost
+            exact = self.exact_cost(node)
+            if np.isinf(distributed) and np.isinf(exact):
+                error = 0.0
+            elif np.isinf(distributed) != np.isinf(exact):
+                error = INF
+            else:
+                error = abs(distributed - exact)
+            if np.isinf(error) or error > 1e-6:
+                wrong += 1
+            if np.isinf(error):
+                max_error = INF
+            elif not np.isinf(max_error):
+                max_error = max(max_error, error)
+            if not failed and not np.isinf(distributed) and not self.route_is_ground_truth_safe(node):
+                unsafe += 1
+        link_conflicts, device_conflicts = self.engine.known_conflict_counts()
+        return {
+            "wrong_nodes": float(wrong),
+            "max_error": max_error,
+            "unsafe_routes": float(unsafe),
+            "inconsistent_handoffs": float(self.engine.handoff_inconsistencies()),
+            "link_conflicts": float(link_conflicts),
+            "device_conflicts": float(device_conflicts),
+        }
+
+    def device_table_rows(self) -> List[Dict[str, str]]:
+        rows: List[Dict[str, str]] = []
+        for device_name, state in self.engine.states.items():
+            route = state.route
+            failed = self.communication.is_device_failed(device_name)
+            rows.append({
+                "device": device_name,
+                "node": state.controlled_node,
+                "V": "FAIL" if failed else finite_text(route.cost),
+                "next": "-" if failed else (self.engine.next_for_node(state.controlled_node) or "-"),
+                "exit": route.exit_id or "-",
+                "safe": "FAIL" if failed else ("OK" if self.route_is_ground_truth_safe(state.controlled_node) else "NO"),
+                "gen": str(state.revision),
+                "inbox": str(len(state.inbox)),
+            })
+        return rows
+
+
+class DistributedLinkStateStrategy(RoutingStrategy):
+    """Static physical topology plus radio-flooded dynamic event strategy."""
+
+    def __init__(
+        self,
+        movement_graph: nx.Graph,
+        communication: CommunicationEngine,
+        devices: Dict[str, GuidanceDevice],
+        controller: MovementGraphController,
+        *,
+        bootstrap_ticks: int = 500,
+        ticks_per_event: int = 1,
+    ) -> None:
+        super().__init__(movement_graph)
+        self.devices = devices
+        self.communication = communication
+        self.controller = controller
+        self.bootstrap_ticks = bootstrap_ticks
+        self.ticks_per_event = ticks_per_event
+        self.engine = DistributedLinkStateEngine(movement_graph, communication, devices)
+        self.diagnostics = LinkStateDiagnostics(self.engine, controller, communication)
+
+    def has_global_policy(self) -> bool:
+        return False
+
+    def recompute(self) -> None:
+        self.engine.run_until_quiet(self.bootstrap_ticks)
+
+    def on_edge_status_changed(self, u: str, v: str) -> None:
+        blocked, version = self.controller.edge_event(u, v)
+        self.engine.observe_incident_edge_change(u, v, blocked, version)
+        self.engine.tick(self.ticks_per_event)
+
+    def on_graph_reset(self, changed_edges: Iterable[EdgeId]) -> None:
+        for u, v in changed_edges:
+            blocked, version = self.controller.edge_event(u, v)
+            self.engine.observe_incident_edge_change(u, v, blocked, version)
+        self.engine.run_until_quiet(self.bootstrap_ticks)
+
+    def on_device_status_changed(self, device_name: str) -> None:
+        failed, version = self.communication.device_event(device_name)
+        self.engine.observe_device_status_change(device_name, failed, version)
+        self.engine.tick(self.ticks_per_event)
+
+    def tick(self, n: int = 1) -> None:
+        self.engine.tick(n)
+
+    def settle_until_quiet(self, max_ticks: int = 500) -> None:
+        self.engine.run_until_quiet(max_ticks)
+
+    def get_value(self, node: str) -> float:
+        device_name = self.communication.device_for_node[node]
+        if self.communication.is_device_failed(device_name):
+            return INF
+        return self.engine.route_for_node(node).cost
+
+    def get_next(self, node: str) -> Optional[str]:
+        device_name = self.communication.device_for_node[node]
+        if self.communication.is_device_failed(device_name):
+            return None
+        return self.engine.next_for_node(node)
+
+    def get_path(self, start: str) -> Tuple[List[str], float]:
+        device_name = self.communication.device_for_node[start]
+        if self.communication.is_device_failed(device_name):
+            raise nx.NetworkXNoPath(f"Guidance device at {start} is failed.")
+        route = self.engine.route_for_node(start)
+        if not route.reachable:
+            raise nx.NetworkXNoPath(f"No distributed link-state route from {start} to an exit.")
+        return list(route.path), float(route.cost)
+
+    def device_policy_arrows(self) -> List[Tuple[np.ndarray, np.ndarray]]:
+        arrows: List[Tuple[np.ndarray, np.ndarray]] = []
+        for device_name, device in self.devices.items():
+            if not device.display or self.communication.is_device_failed(device_name):
+                continue
+            node = device.controlled_node
+            nxt = self.engine.next_for_node(node)
+            if nxt is None or not self.engine.route_is_locally_structurally_safe(node):
+                continue
+            start = np.array(device.position, dtype=float)
+            direction = self.G.nodes[nxt]["position"] - start
+            norm = float(np.linalg.norm(direction))
+            if norm > 1e-9:
+                arrows.append((start, direction / norm))
+        return arrows
+
+    def debug_summary(self) -> str:
+        summary = self.diagnostics.global_summary()
+        failed = sum(self.communication.is_device_failed(name) for name in self.devices)
+        components = len(self.communication.live_components())
+        status = (
+            f"link-state ticks={self.engine.tick_count} | pending={self.engine.pending_work()} | "
+            f"accepted={self.engine.last_events_accepted} | msgs={self.engine.last_messages_sent} | "
+            f"failed={failed} | radio_components={components} | wrong_nodes={int(summary['wrong_nodes'])} | "
+            f"handoff_conflicts={int(summary['inconsistent_handoffs'])} | "
+            f"event_conflicts={int(summary['link_conflicts'] + summary['device_conflicts'])} | "
+            f"max_err={finite_text(summary['max_error'], 2)} | unsafe={int(summary['unsafe_routes'])}"
+        )
+        warning = self.communication.live_partition_warning()
+        return status if warning is None else status + "\nWARNING: " + warning
+
+    def device_table_rows(self) -> List[Dict[str, str]]:
+        return self.diagnostics.device_table_rows()
+
+
+
 class StrategyManager:
     def __init__(self) -> None:
         self._strategies: Dict[str, RoutingStrategy] = {}
@@ -877,6 +1621,10 @@ class StrategyManager:
         for strategy in self._strategies.values():
             strategy.on_graph_reset(changed)
 
+    def notify_device_status_changed(self, device_name: str) -> None:
+        for strategy in self._strategies.values():
+            strategy.on_device_status_changed(device_name)
+
 
 # ============================================================
 # INTERACTIVE VIEWER
@@ -904,14 +1652,18 @@ class InteractiveBuildingViewer:
         self.current_start = self.start_nodes[0]
         self.edge_list = list(self.G.edges())
         self.selected_edge_index = 0
+        self.device_names = [name for name, device in self.geometry.devices.items() if device.display]
+        self.selected_device_index = 0
         self.pick_mode = "node"
         self.gossip_ticks_per_click = 1
         self.gossip_settle_ticks = 500
         self.edge_actors: Dict[EdgeId, Any] = {}
+        self.device_actors: Dict[str, Any] = {}
         self.path_actor = None
         self.heatmap_actor = None
         self.selected_node_actor = None
         self.selected_edge_actor = None
+        self.selected_device_actor = None
         self.policy_arrow_actors: List[Any] = []
         self.device_arrow_actors: List[Any] = []
         self.current_path: Optional[List[str]] = None
@@ -979,9 +1731,26 @@ class InteractiveBuildingViewer:
             self.strategies.notify_edge_changed(u, v)
         self.refresh_after_incremental_update()
 
+    def _selected_device(self) -> str:
+        return self.device_names[self.selected_device_index]
+
+    def toggle_selected_device(self) -> None:
+        device_name = self._selected_device()
+        if self.communication.toggle_device_failed(device_name):
+            self.strategies.notify_device_status_changed(device_name)
+            warning = self.communication.live_partition_warning()
+            if warning is not None:
+                print(f"WARNING: {warning}")
+        self.refresh_after_incremental_update()
+
     def reset_edges(self) -> None:
         changed = self.controller.reset_edges()
         self.strategies.notify_graph_reset(changed)
+        self.refresh_after_incremental_update()
+
+    def reset_device_failures(self) -> None:
+        for device_name in self.communication.reset_device_failures():
+            self.strategies.notify_device_status_changed(device_name)
         self.refresh_after_incremental_update()
 
     def tick_distributed_once(self) -> None:
@@ -1020,10 +1789,13 @@ class InteractiveBuildingViewer:
             (self.next_strategy, "Next strategy"),
             (self.tick_distributed_once, "Tick distributed"),
             (self.settle_distributed, "Settle distributed"),
+            (self.toggle_selected_device, "Toggle device fault"),
+            (self.reset_device_failures, "Reset device faults"),
             (self.print_device_table, "Print device table"),
             (self.print_path_info, "Print path"),
             (lambda: self._set_pick_mode("node"), "Pick: node"),
             (lambda: self._set_pick_mode("edge"), "Pick: edge"),
+            (lambda: self._set_pick_mode("device"), "Pick: device"),
         ]
         y = 10 + len(actions) * 40
         for callback, label in actions:
@@ -1046,7 +1818,7 @@ class InteractiveBuildingViewer:
                 self.current_start = node
                 self._highlight_selected_node(node)
                 self.refresh_path_only()
-        else:
+        elif self.pick_mode == "edge":
             best_edge: Optional[Tuple[str, str]] = None
             best_distance = INF
             for u, v in self.G.edges:
@@ -1061,6 +1833,17 @@ class InteractiveBuildingViewer:
                 self.selected_edge_index = [canonical_edge(*e) for e in self.edge_list].index(canonical)
                 self.toggle_selected_edge()
                 self._highlight_selected_edge(*best_edge)
+        else:
+            candidates = [
+                (float(np.linalg.norm(np.array(self.geometry.devices[name].position) - p)), name)
+                for name in self.device_names
+            ]
+            distance, device_name = min(candidates)
+            if distance <= 3.0:
+                self.selected_device_index = self.device_names.index(device_name)
+                self._highlight_selected_device(device_name)
+                self._update_text()
+                self.plotter.render()
 
     def _add_static_scene(self) -> None:
         for space in self.geometry.spaces.values():
@@ -1075,9 +1858,16 @@ class InteractiveBuildingViewer:
         for u, v in self.G.edges:
             actor = self.plotter.add_mesh(pv.Line(self.G.nodes[u]["position"], self.G.nodes[v]["position"]), color="gray", line_width=4, pickable=True)
             self.edge_actors[canonical_edge(u, v)] = actor
-        display_devices = [d for d in self.geometry.devices.values() if d.display]
-        device_points = np.array([d.position for d in display_devices], dtype=float)
-        self.plotter.add_mesh(pv.PolyData(device_points), color="orange", point_size=13, render_points_as_spheres=True, pickable=False)
+        for name, device in self.geometry.devices.items():
+            if not device.display:
+                continue
+            self.device_actors[name] = self.plotter.add_mesh(
+                pv.PolyData(np.array([device.position], dtype=float)),
+                color="orange",
+                point_size=13,
+                render_points_as_spheres=True,
+                pickable=False,
+            )
         for left, right in self.C.edges:
             p0 = self.C.nodes[left]["position"]
             p1 = self.C.nodes[right]["position"]
@@ -1100,6 +1890,18 @@ class InteractiveBuildingViewer:
             pv.Line(self.G.nodes[u]["position"], self.G.nodes[v]["position"]),
             color="orange",
             line_width=10,
+            pickable=False,
+            reset_camera=False,
+        )
+
+    def _highlight_selected_device(self, device_name: str) -> None:
+        if self.selected_device_actor is not None:
+            self.plotter.remove_actor(self.selected_device_actor)
+        self.selected_device_actor = self.plotter.add_mesh(
+            pv.Sphere(radius=0.45, center=self.geometry.devices[device_name].position),
+            color="magenta",
+            style="wireframe",
+            line_width=3,
             pickable=False,
             reset_camera=False,
         )
@@ -1165,6 +1967,8 @@ class InteractiveBuildingViewer:
                         reset_camera=False,
                     )
                 )
+        for device_name, actor in self.device_actors.items():
+            actor.prop.color = (0.85, 0.1, 0.1) if self.communication.is_device_failed(device_name) else (1.0, 0.55, 0.0)
         path_edges = {canonical_edge(self.current_path[i], self.current_path[i+1]) for i in range(len(self.current_path or []) - 1)}
         for edge, actor in self.edge_actors.items():
             actor.prop.line_width = 4
@@ -1182,16 +1986,21 @@ class InteractiveBuildingViewer:
         except Exception as exc:
             self.error = str(exc)
         try:
-            _, self.exact_cost = self.controller.shortest_path_to_nearest_exit(self.current_start)
+            strategy = self.strategy()
+            if hasattr(strategy, "diagnostics"):
+                self.exact_cost = strategy.diagnostics.exact_cost(self.current_start)
+            else:
+                _, self.exact_cost = self.controller.shortest_path_to_nearest_exit(self.current_start)
         except nx.NetworkXNoPath:
             self.exact_cost = INF
 
     def _table_text(self, max_rows: int = 18) -> str:
         strategy = self.strategy()
         if not hasattr(strategy, "device_table_rows"):
-            return "Device table available in path-vector mode"
+            return "Device table available in distributed modes"
         rows = strategy.device_table_rows()
-        lines = ["Local path-vector device state", f"{'Node':<9} {'V':>6} {'Next':<9} {'Exit':<7} {'Safe':<4} {'Gen':>4}", "-" * 47]
+        title = "Local link-state device view" if isinstance(strategy, DistributedLinkStateStrategy) else "Local path-vector device state"
+        lines = [title, f"{'Node':<9} {'V':>6} {'Next':<9} {'Exit':<7} {'Safe':<4} {'Gen':>4}", "-" * 47]
         for row in rows[:max_rows]:
             lines.append(f"{row['node']:<9} {row['V']:>6} {row['next']:<9} {row['exit']:<7} {row['safe']:<4} {row['gen']:>4}")
         if len(rows) > max_rows:
@@ -1203,16 +2012,19 @@ class InteractiveBuildingViewer:
         self.plotter.remove_actor("table", render=False)
         self.plotter.remove_actor("help", render=False)
         value = self.strategy().get_value(self.current_start)
+        selected_device = self._selected_device()
+        failure_text = "FAILED" if self.communication.is_device_failed(selected_device) else "active"
         lines = [
             f"Start: {self.current_start} | Strategy: {self.strategies.current_name()} | Pick: {self.pick_mode}",
-            f"Local/distributed value: {finite_text(value, 2)} | Exact diagnostic cost: {finite_text(self.exact_cost if self.exact_cost is not None else INF, 2)}",
+            f"Selected device: {selected_device} ({failure_text})",
+            f"Strategy value: {finite_text(value, 2)} | Exact diagnostic cost: {finite_text(self.exact_cost if self.exact_cost is not None else INF, 2)}",
         ]
         if hasattr(self.strategy(), "debug_summary"):
             lines.append(self.strategy().debug_summary())
         lines.append(f"Status: {self.error}" if self.error else "Path: " + " -> ".join(self.current_path or []))
         self.plotter.add_text("\n".join(lines), position="upper_left", font_size=9, name="status")
         self.plotter.add_text(self._table_text(), position="upper_right", font_size=8, name="table")
-        self.plotter.add_text("Pick an edge to block/unblock | Tick shows propagation | Orange arrows are local device decisions", position="lower_left", font_size=9, name="help")
+        self.plotter.add_text("Pick edge: block/unblock | Pick device + Toggle fault: link-state fault event | Orange arrows: local decisions", position="lower_left", font_size=9, name="help")
 
     def refresh_full(self) -> None:
         self.strategy().recompute()
@@ -1235,7 +2047,7 @@ class InteractiveBuildingViewer:
     def print_device_table(self) -> None:
         strategy = self.strategy()
         if not hasattr(strategy, "device_table_rows"):
-            print("Device table available in distributed path-vector mode.")
+            print("Device table available in distributed modes.")
             return
         rows = strategy.device_table_rows()
         print(f"\n{'Node':<10} {'Cost':>8} {'Next':<10} {'Exit':<10} {'Safe':<5} {'Gen':>5} {'Inbox':>6}")
@@ -1272,6 +2084,7 @@ class InteractiveBuildingViewer:
         self.refresh_full()
         self._highlight_selected_node(self.current_start)
         self._highlight_selected_edge(*self._selected_edge())
+        self._highlight_selected_device(self._selected_device())
 
     def show(self) -> None:
         self.build_scene(enable_picking=True)
@@ -1287,6 +2100,10 @@ def build_application(num_floors: int = 2) -> Tuple[BuildingGeometry, MovementGr
     controller = MovementGraphController(geometry.movement_graph)
     communication = CommunicationEngine(geometry.devices)
     communication.validate_connectivity()
+    communication.validate_single_device_failure_tolerance()
+    # Required by the preserved path-vector strategy; the link-state strategy
+    # needs radio connectivity for event dissemination but does not require a
+    # direct radio edge for every physical movement edge.
     communication.validate_movement_adjacency_links(geometry.movement_graph)
     manager = StrategyManager()
     manager.register("centralized-bellman-oracle", CentralizedBellmanStrategy(geometry.movement_graph))
@@ -1299,6 +2116,15 @@ def build_application(num_floors: int = 2) -> Tuple[BuildingGeometry, MovementGr
         ticks_per_event=1,
     )
     manager.register("distributed-path-vector", distributed)
+    link_state = DistributedLinkStateStrategy(
+        geometry.movement_graph,
+        communication,
+        geometry.devices,
+        controller,
+        bootstrap_ticks=500,
+        ticks_per_event=1,
+    )
+    manager.register("distributed-link-state", link_state)
     return geometry, controller, communication, manager
 
 
