@@ -1,8 +1,8 @@
 # Navilight
 
-<p align="center">
-  <img src="assets/navilight.gif" alt="Navilight dynamic indoor evacuation guidance simulation" width="720">
-</p>
+| Single-floor link failure | Two spreading fires and exit closure; two-floor rerouting. |
+|-------|-------|
+| <img src="assets/navilight.gif" alt="Dynamic Indoor Evacuation Guidance Simulation 1" width="360"> | <img src="assets/navilight_006.gif" alt="Dynamic Indoor Evacuation Guidance Simulation 2" width="360"> |
 
 
 **Navilight** is a proof-of-concept for **distributed adaptive evacuation guidance** in smart buildings. Distributed guidance devices exchange local information and update the direction shown to evacuees when corridors, stairs or exits become unavailable.
@@ -281,8 +281,6 @@ where $\tau(u)$ is a deterministic tie-breaking key. The selected neighbour $u_i
 
 Once all relevant events have propagated, devices holding the same topology state construct the same graph $G_i$ and compute the same deterministic shortest-path policy.
 
-
-
 ## Run
 
 Requirements:
@@ -317,7 +315,15 @@ python recorded_demo_qt.py --preset fast-two-floor
 
 For recording, `--manual-start` keeps the scenario paused while the camera is positioned. `--start-delay-frames N` adds a fixed delay before the first physical event. `--ticks-per-update` controls protocol progress between redraws; using several ticks per update represents fast device communication without requiring equally frequent PyVista rendering.
 
+```bash
+pytest -q
+```
+
+The protocol tests verify route propagation, withdrawal handling, deterministic routing and agreement with the centralized reference after settlement.
+
 ## UI interactions
+
+<img src="assets/UI.png" alt="UI meaning" width="720">
 
 | Action | Effect |
 |---|---|
@@ -339,9 +345,3 @@ Rendering conventions:
 | Green path | Route from the selected start node |
 | Red edge | Blocked movement link |
 | Cyan link | Communication graph edge |
-
-```bash
-pytest -q
-```
-
-The protocol tests verify route propagation, withdrawal handling, deterministic routing and agreement with the centralized reference after settlement.
