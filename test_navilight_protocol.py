@@ -74,5 +74,5 @@ def test_stale_edge_observation_cannot_reopen_newer_blocked_link():
     assert blocked is True
     strategy.engine.observe_incident_edge_change("J1_W", "SW1", blocked, version)
     strategy.engine.observe_incident_edge_change("J1_W", "SW1", False, version - 1)
-    device = strategy.engine.node_to_device["J1_W"]
+    device = strategy.engine.device_for_node["J1_W"]
     assert strategy.engine.states[device].links["SW1"].blocked is True
