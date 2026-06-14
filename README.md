@@ -79,81 +79,6 @@ sequenceDiagram
     Ref-->>Diag: Exact reference routes
     PV-->>Diag: Distributed route state
 ```
-<!--
-## Distributed strategies
-
-### Path-vector-style
-
-Each exit originates a zero-cost route. Devices process advertisements "asynchronously", reject routes containing their own identifier, add the cost of the corresponding movement link and select the best valid route using deterministic tie-breaking. Changes are propagated as updated advertisements or explicit withdrawals.
-
-Let $x_i$ be the movement node controlled by device $i$. An advertisement received from device $j$ contains its selected cost $d_j$ and path $P_j$. Device $i$ accepts it as a candidate only when the corresponding movement link is available and the resulting path is loop-free:
-
-$$
-\mathcal{C}_i =
-\left\{
-j \in \mathcal{N}^{\mathrm{comm}}_i
-\;\middle|\;
-(x_i,x_j) \in E_{\mathrm{move}},\;
-i \notin P_j
-\right\}.
-$$
-
-For every valid candidate, the cost through $j$ is
-
-$$
-d_i(j) = w(x_i,x_j) + d_j,
-\qquad
-P_i(j) = (i) \mathbin{\|} P_j.
-$$
-
-The selected route is the minimum-cost candidate, with a deterministic secondary key $\tau$ resolving equal-cost alternatives:
-
-$$
-j_i^\star =
-\underset{j \in \mathcal{C}_i}{\arg\min}
-\left(d_i(j), \tau(j,P_j)\right).
-$$
-
-If $\mathcal{C}_i=\varnothing$, device $i$ has no valid route and advertises an explicit withdrawal. Otherwise, it advertises $\left(d_i(j_i^\star),P_i(j_i^\star)\right)$.
-
-The result is a distributed next-hop policy built from local state and local communication. During propagation, devices may temporarily hold different views; after messages settle in a connected communication component, their selected routes can be compared with the centralized reference.
-
-### Link-state-style
-
-Devices start from the known static movement topology and distribute versioned events describing blocked or restored links and device availability. Each device applies the newest events received through local communication, updates its local topology and runs Dijkstra to select the next movement hop.
-
-A physical change is represented by a versioned event
-
-$$
-e = (\ell, s, \nu),
-$$
-
-where $\ell$ identifies a movement link, $s$ is its new state and $\nu$ is a monotonically increasing version. Device $i$ applies the event only when
-
-$$
-\nu > \nu_i(\ell),
-$$
-
-then forwards it through the communication graph. This rule makes repeated and out-of-order deliveries idempotent.
-
-Let $G_i=(V,E_i)$ be device $i$'s local movement graph after applying its known events, and let $X\subseteq V$ be the exits. The local distance to safety is
-
-$$
-D_i(v) = \min_{x \in X} \operatorname{dist}_{G_i}(v,x).
-$$
-
-For the controlled node $x_i$, the guidance decision is the available neighbour
-
-$$
-u_i^\star =
-\underset{u:(x_i,u)\in E_i}{\arg\min}
-\left(w(x_i,u)+D_i(u), \tau(u)\right),
-$$
-
-again using deterministic tie-breaking. If no exit is reachable, the device exposes no valid guidance hop.
-
-Once all relevant events have propagated, devices with the same topology state compute the same deterministic shortest-path policy.
--->
 
 -------------------
 ## Distributed strategies
@@ -181,15 +106,17 @@ Device $i$ can use an advertisement from $j$ only if the devices can communicate
 
 $$
 \mathcal{C}_i =
-\left\{
+\{ 
 j \in \mathcal{N}^{\mathrm{comm}} \ | \ 
 (x_i,x_j) \in E_{\mathrm{move}} ,
 \quad
 x_i \notin P_j,
 \quad
-d_j < \infty
-\right\}.
+d_j < \infty 
+\}
 $$
+
+
 
 Therefore, $\mathcal{C}_i$ is the set of valid next-device candidates currently known by device $i$.
 
@@ -261,16 +188,16 @@ Let $X\subseteq V_{\mathrm{move}}$ be the set of exit nodes. Using Dijkstra's al
 $$
 D_i(v)=
 \min_{x\in X}
-\operatorname{dist}_{G_i}(v,x),
+\text{dist}_{G_i}(v,x),
 $$
 
-where $\operatorname{dist}_{G_i}(v,x)$ is the shortest-path cost from $v$ to exit $x$ in device $i$'s local graph. If no exit is reachable, this distance is $\infty$.
+where $\text{dist}_{G_i}(v,x)$ is the shortest-path cost from $v$ to exit $x$ in device $i$'s local graph. If no exit is reachable, this distance is $\infty$.
 
 From its controlled node $x_i$, device $i$ selects the available neighbour that minimizes the complete remaining route cost:
 
 $$
 u_i^\star =
-\underset{u:(x_i,u)\in E_i}{\arg\min}_{\mathrm{lex}}
+\underset{u:(x_i,u)\in E_i}{{\arg\min}_{\mathrm{lex}}}
 \left(
 w(x_i,u)+D_i(u),
 \tau(u)
