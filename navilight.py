@@ -1,10 +1,15 @@
-"""
+r"""
 Navilight: distributed adaptive indoor evacuation guidance proof of concept.
 
 The simulator separates the physical world from the information network:
 
-- Movement graph ``G_M``: weighted walkable links between routing waypoints.
-- Communication graph ``G_C``: radio/data links between guidance devices.
+- Movement graph $$G_{\mathrm{move}}=(V_{\mathrm{move}},E_{\mathrm{move}},w)$$:
+  currently available weighted links between movement nodes.
+- Original movement topology $$E_{\mathrm{move}}^0$$: all movement links before
+  dynamic failures. In code, ``movement_graph`` stores this topology and marks
+  unavailable links with ``blocked=True``.
+- Communication graph: radio/data links between devices $$i\in\mathcal{D}$$;
+  the neighbours of device $$i$$ are $$\mathcal{N}^{\mathrm{comm}}_i$$.
 - Routing strategies: local device state and protocol logic.
 - Viewer: PyVista rendering, interaction and diagnostic comparison.
 
@@ -14,10 +19,11 @@ Implemented strategies:
 - ``distributed-path-vector``: devices exchange selected routes with adjacent
   movement neighbours and display the first hop of their local route.
 - ``distributed-link-state``: devices flood dynamic link/device events over the
-  radio graph, rebuild a local usable topology and compute deterministic routes.
+  communication graph, rebuild a local usable topology and compute deterministic routes.
 
-A movement node is a routing state, not necessarily a semantic room. Corridor
-lights are modelled by explicit waypoint nodes associated with a device.
+A movement node $$v\in V_{\mathrm{move}}$$ is a routing state, not necessarily
+a semantic room. Device $$i$$ controls exactly one such node $$x_i$$. Corridor
+lights are modelled by explicit movement nodes associated with devices.
 """
 
 from __future__ import annotations
@@ -42,12 +48,12 @@ INF = float("inf")
 
 
 def canonical_edge(u: str, v: str) -> EdgeId:
-    """Return an undirected edge identifier with deterministic endpoint order."""
+    r"""Return a canonical identifier for undirected link $$\ell=\{u,v\}$$."""
     return tuple(sorted((u, v)))
 
 
 def finite_text(value: float, digits: int = 1) -> str:
-    """Format finite costs and keep infinity readable in UI/debug output."""
+    r"""Format finite route costs and keep $$\infty$$ readable in UI/debug output."""
     return "inf" if np.isinf(value) else f"{value:.{digits}f}"
 
 
@@ -69,11 +75,11 @@ class Space:
 
 @dataclass
 class GuidanceDevice:
-    """Physical indicator/controller associated with one routing waypoint.
+    r"""Physical indicator/controller $$i\in\mathcal{D}$$ associated with $$x_i$$.
 
     ``controlled_node`` is explicit.  There is no nearest-node approximation:
-    if a light is mounted halfway along a corridor, the movement graph must
-    contain a waypoint at that position.
+    if a light is mounted halfway along a corridor, $$V_{\mathrm{move}}$$ must
+    contain a movement node at that position.
     """
 
     name: str
@@ -85,7 +91,7 @@ class GuidanceDevice:
 
 
 class BuildingGeometry:
-    """Physical building geometry, movement graph and installed devices."""
+    r"""Building geometry, stored movement topology and devices $$\mathcal{D}$$."""
 
     def __init__(self) -> None:
         """Create empty containers for spaces, routing graph and devices."""
@@ -114,7 +120,7 @@ class BuildingGeometry:
         label: Optional[str] = None,
         **attrs: Any,
     ) -> None:
-        """Add one routing waypoint to the physical movement graph."""
+        r"""Add one movement node $$v\in V_{\mathrm{move}}$$."""
         self.movement_graph.add_node(
             node_id,
             kind=kind,
@@ -124,14 +130,17 @@ class BuildingGeometry:
         )
 
     def add_movement_edge(self, u: str, v: str, weight: Optional[float] = None, **attrs: Any) -> None:
-        """Add a weighted walkable link between two routing waypoints."""
+        r"""Add link $$(u,v)\in E_{\mathrm{move}}^0$$ with cost $$w(u,v)>0$$."""
         p0 = self.movement_graph.nodes[u]["position"]
         p1 = self.movement_graph.nodes[v]["position"]
         base_weight = float(np.linalg.norm(p1 - p0)) if weight is None else float(weight)
         self.movement_graph.add_edge(
             u,
             v,
+            # ``base_weight`` stores the immutable mathematical cost $$w(u,v)$$.
             base_weight=base_weight,
+            # NetworkX keeps blocked links in the stored topology; mathematically
+            # only links with ``blocked=False`` belong to $$E_{\mathrm{move}}$$.
             weight=base_weight,
             blocked=False,
             version=0,
@@ -148,7 +157,7 @@ class BuildingGeometry:
         display: bool = True,
         **metadata: Any,
     ) -> None:
-        """Install a guidance device that controls exactly one movement node."""
+        r"""Install device $$i\in\mathcal{D}$$ controlling exactly one node $$x_i$$."""
         if controlled_node not in self.movement_graph:
             raise KeyError(f"Unknown controlled movement node: {controlled_node}")
         if position is None:
@@ -164,11 +173,11 @@ class BuildingGeometry:
         )
 
     def deploy_device_at_every_routing_node(self, communication_radius: float = 15.0) -> None:
-        """Install one route agent/indicator at each routing state.
+        r"""Install one device $$i$$ for every $$x_i\in V_{\mathrm{move}}$$.
 
         This is a proof-of-concept deployment assumption: every decision point
-        represented in G_M is instrumented.  Devices do not need global state;
-        they only control their own node and communicate with nearby devices.
+        in $$V_{\mathrm{move}}$$ is instrumented. Devices control only $$x_i$$
+        and communicate with devices in $$\mathcal{N}^{\mathrm{comm}}_i$$.
         """
         self.devices.clear()
         for node, attrs in self.movement_graph.nodes(data=True):
@@ -234,7 +243,7 @@ class BuildingGeometry:
             b.add_movement_edge(f"R_{letters[4]}", f"J{level}_E")
             b.add_movement_edge(f"R_{letters[1]}", f"L_{level}")
             b.add_movement_edge(f"R_{letters[3]}", f"L_{level}")
-            # Explicit waypoints model corridor-mounted direction indicators.
+            # Explicit movement nodes model corridor-mounted guidance devices.
             b.add_movement_edge(f"J{level}_W", f"W{level}_WC")
             b.add_movement_edge(f"W{level}_WC", f"J{level}_C")
             b.add_movement_edge(f"J{level}_C", f"W{level}_CE")
@@ -258,14 +267,14 @@ class BuildingGeometry:
 
 
 class MovementGraphController:
-    """Mutation boundary for the physical movement topology."""
+    r"""Mutation boundary for currently available links $$E_{\mathrm{move}}$$."""
 
     def __init__(self, movement_graph: nx.Graph) -> None:
         """Wrap the movement graph and centralize physical link mutations."""
         self.G = movement_graph
 
     def set_edge_blocked(self, u: str, v: str, blocked: bool = True) -> bool:
-        """Set the blocked state of a movement edge and bump its version."""
+        r"""Remove or restore $$(u,v)$$ in $$E_{\mathrm{move}}$$ and increment $$\nu$$."""
         edge = self.G[u][v]
         if bool(edge.get("blocked", False)) == blocked:
             return False
@@ -274,11 +283,11 @@ class MovementGraphController:
         return True
 
     def toggle_edge(self, u: str, v: str) -> bool:
-        """Invert the blocked state of one movement edge."""
+        r"""Toggle whether $$(u,v)$$ belongs to $$E_{\mathrm{move}}$$."""
         return self.set_edge_blocked(u, v, not bool(self.G[u][v].get("blocked", False)))
 
     def reset_edges(self) -> List[EdgeId]:
-        """Unblock all movement links and return the edges that changed."""
+        r"""Restore $$E_{\mathrm{move}}=E_{\mathrm{move}}^0$$ and return changed links."""
         changed: List[EdgeId] = []
         for u, v in self.G.edges:
             if self.set_edge_blocked(u, v, False):
@@ -286,15 +295,16 @@ class MovementGraphController:
         return changed
 
     def edge_event(self, u: str, v: str) -> Tuple[bool, int]:
-        """Return the current blocked/version tuple for one movement edge."""
+        r"""Return state $$s$$ and version $$\nu$$ for link $$\ell=(u,v)$$."""
         edge = self.G[u][v]
         return bool(edge.get("blocked", False)), int(edge.get("version", 0))
 
     def shortest_path_to_nearest_exit(self, start: str) -> Tuple[List[str], float]:
-        """Compute the observer-side exact route to the nearest reachable exit."""
+        r"""Compute $$\min_{x\in X}\operatorname{dist}_{G_{\mathrm{move}}}(start,x)$$."""
         usable = nx.Graph()
         usable.add_nodes_from(self.G.nodes)
         for u, v, attrs in self.G.edges(data=True):
+            # Materialize the mathematical current edge set $$E_{\mathrm{move}}$$.
             if not attrs.get("blocked", False):
                 usable.add_edge(u, v, weight=float(attrs["base_weight"]))
         exits = [n for n, attrs in self.G.nodes(data=True) if attrs["kind"] == "exit"]
@@ -318,19 +328,20 @@ class MovementGraphController:
 # ============================================================
 
 class CommunicationEngine:
-    """Static radio topology plus ground-truth device availability.
+    r"""Static communication topology plus ground-truth device availability.
 
     ``communication_graph`` describes which installed devices can exchange
-    packets when both are alive.  Dynamic failures do not delete graph nodes:
-    strategies must learn them through status events, exactly as they learn
-    remote blocked links.
+    packets when both are alive; its neighbours of device $$i$$ are
+    $$\mathcal{N}^{\mathrm{comm}}_i$$. Dynamic failures do not delete graph
+    nodes: strategies must learn them through status events.
     """
 
     def __init__(self, devices: Dict[str, GuidanceDevice]) -> None:
-        """Build the static radio graph from deployed device positions."""
+        r"""Build the static communication graph over $$\mathcal{D}$$."""
         self.devices = devices
         self.communication_graph = nx.Graph()
-        # Movement nodes and physical devices intentionally keep distinct IDs.
+        # Device identifiers $$i\in\mathcal{D}$$ and controlled nodes $$x_i$$
+        # intentionally use distinct identifiers.
         self.device_for_node: Dict[str, str] = {}
         self._failed_devices: Dict[str, bool] = {name: False for name in devices}
         self._device_versions: Dict[str, int] = {name: 0 for name in devices}
@@ -367,7 +378,7 @@ class CommunicationEngine:
         return recovered
 
     def rebuild(self) -> None:
-        """Recompute device-to-device radio links from positions and radii."""
+        r"""Recompute every communication neighbourhood $$\mathcal{N}^{\mathrm{comm}}_i$$."""
         graph = nx.Graph()
         self.device_for_node.clear()
         for name, device in self.devices.items():
@@ -385,7 +396,7 @@ class CommunicationEngine:
         self.communication_graph = graph
 
     def validate_connectivity(self) -> None:
-        """Fail fast if the deployment radio graph is disconnected."""
+        """Fail fast if the deployment communication graph is disconnected."""
         if not self.communication_graph.nodes:
             raise RuntimeError("No guidance devices deployed.")
         if not nx.is_connected(self.communication_graph):
@@ -393,12 +404,11 @@ class CommunicationEngine:
             raise RuntimeError(f"Communication graph is disconnected: {components}")
 
     def validate_single_device_failure_tolerance(self) -> None:
-        """Require radio redundancy against any single guidance-device failure.
+        """Require communication redundancy against one guidance-device failure.
 
         This is a deployment-time validation, not a promise under arbitrary
-        simultaneous failures.  If later failures partition the live radio
-        graph, the application reports a runtime warning because global event
-        agreement can no longer be guaranteed.
+        simultaneous failures. If later failures partition the live
+        communication graph, global event agreement is no longer guaranteed.
         """
         if self.communication_graph.number_of_nodes() < 3:
             raise RuntimeError("At least three devices are required for single-failure radio redundancy.")
@@ -410,7 +420,7 @@ class CommunicationEngine:
             )
 
     def live_communication_graph(self) -> nx.Graph:
-        """Return the current radio graph induced by non-failed devices."""
+        r"""Return the communication graph induced by live devices in $$\mathcal{D}$$."""
         live_devices = [
             name for name in self.communication_graph.nodes
             if not self.is_device_failed(name)
@@ -418,14 +428,14 @@ class CommunicationEngine:
         return self.communication_graph.subgraph(live_devices).copy()
 
     def live_components(self) -> List[Set[str]]:
-        """Return connected components of the live radio graph."""
+        """Return connected components of the live communication graph."""
         live_graph = self.live_communication_graph()
         if live_graph.number_of_nodes() == 0:
             return []
         return [set(component) for component in nx.connected_components(live_graph)]
 
     def live_partition_warning(self) -> Optional[str]:
-        """Return a runtime warning when live devices are radio-partitioned."""
+        """Warn when live devices are partitioned in the communication graph."""
         components = self.live_components()
         if len(components) <= 1:
             return None
@@ -436,7 +446,7 @@ class CommunicationEngine:
         )
 
     def validate_movement_adjacency_links(self, movement_graph: nx.Graph) -> None:
-        """Every physical one-hop routing candidate must have a data link."""
+        r"""Require $$j\in\mathcal{N}^{\mathrm{comm}}_i$$ for every $$(x_i,x_j)\in E_{\mathrm{move}}^0$$. """
         missing: List[EdgeId] = []
         for u, v in movement_graph.edges:
             du = self.device_for_node.get(u)
@@ -455,7 +465,7 @@ class CommunicationEngine:
 # ============================================================
 
 class RoutingStrategy(ABC):
-    """Common interface exposed by centralized and distributed routing views."""
+    r"""Common interface for policies over movement nodes $$V_{\mathrm{move}}$$."""
     def __init__(self, movement_graph: nx.Graph) -> None:
         """Store the shared movement graph reference for the strategy."""
         self.G = movement_graph
@@ -467,12 +477,12 @@ class RoutingStrategy(ABC):
 
     @abstractmethod
     def get_value(self, node: str) -> float:
-        """Return the route cost currently known for a movement node."""
+        r"""Return the strategy's known remaining route cost for $$v\in V_{\mathrm{move}}$$."""
         raise NotImplementedError
 
     @abstractmethod
     def get_next(self, node: str) -> Optional[str]:
-        """Return the next physical hop selected for a movement node."""
+        r"""Return the selected next movement node from $$v\in V_{\mathrm{move}}$$."""
         raise NotImplementedError
 
     @abstractmethod
@@ -508,8 +518,18 @@ class RoutingStrategy(ABC):
 class CentralizedBellmanStrategy(RoutingStrategy):
     r"""Synchronous Bellman relaxation retained as a reference strategy.
 
-    V(x) = 0 for exits, otherwise
-    V(x) = \min_{y \in N(x)} (c(x,y) + V(y)).
+    The observer-side value $$D_{\mathrm{ref}}(v)$$ is the exact shortest
+    distance from $$v$$ to the exit set $$X$$ in $$G_{\mathrm{move}}$$:
+
+    $$D_{\mathrm{ref}}(v)=\min_{x\in X}
+    \operatorname{dist}_{G_{\mathrm{move}}}(v,x).$$
+
+    Bellman relaxation evaluates
+
+    $$D_{\mathrm{ref}}(v)=\min_{u:(v,u)\in E_{\mathrm{move}}}
+    \left(w(v,u)+D_{\mathrm{ref}}(u)\right),$$
+
+    with $$D_{\mathrm{ref}}(x)=0$$ for every $$x\in X$$.
 
     The reference state is stored inside this strategy.  It does not mutate
     the movement graph fields used by another strategy.
@@ -523,7 +543,7 @@ class CentralizedBellmanStrategy(RoutingStrategy):
         self.next_hops: Dict[str, Optional[str]] = {}
 
     def recompute(self) -> None:
-        """Run synchronous Bellman relaxations on the full movement graph."""
+        r"""Relax $$D_{\mathrm{ref}}$$ synchronously over $$G_{\mathrm{move}}$$."""
         self.values = {
             node: 0.0 if attrs["kind"] == "exit" else INF
             for node, attrs in self.G.nodes(data=True)
@@ -537,6 +557,7 @@ class CentralizedBellmanStrategy(RoutingStrategy):
                     new_values[x], new_next[x] = 0.0, None
                     continue
                 candidates = [
+                    # $$w(v,u)+D_{\mathrm{ref}}(u)$$ for each available neighbour $$u$$.
                     (float(self.G[x][y]["base_weight"]) + self.values[y], y)
                     for y in self.G.neighbors(x)
                     if not self.G[x][y].get("blocked", False)
@@ -550,7 +571,7 @@ class CentralizedBellmanStrategy(RoutingStrategy):
             self.values, self.next_hops = new_values, new_next
 
     def get_value(self, node: str) -> float:
-        """Return the oracle cost value for one node."""
+        r"""Return $$D_{\mathrm{ref}}(v)$$ for one movement node $$v$$."""
         return self.values.get(node, INF)
 
     def get_next(self, node: str) -> Optional[str]:
@@ -579,37 +600,40 @@ class CentralizedBellmanStrategy(RoutingStrategy):
 # ============================================================
 # LOCAL PATH-VECTOR ROUTING PROTOCOL
 # ============================================================
+#
+# Device $$i\in\mathcal{D}$$ controls $$x_i\in V_{\mathrm{move}}$$ and
+# exchanges selected routes with $$\mathcal{N}^{\mathrm{comm}}_i$$.
 
 @dataclass(frozen=True)
 class LocalLink:
-    """One incident physical link as known by a path-vector agent."""
+    r"""Device $$i$$'s local state for incident link $$(x_i,x_j)$$."""
     neighbor_node: str
-    cost: float
+    cost: float  # Immutable traversal cost $$w(x_i,x_j)$$.
     blocked: bool
     version: int
 
 
 @dataclass(frozen=True)
 class RouteAdvertisement:
-    """One device's selected route, or its explicit withdrawal."""
+    r"""Device $$j$$'s latest advertised route $$(d_j,P_j)$$ or withdrawal."""
 
     sender_device: str
-    sender_node: str
+    sender_node: str  # Controlled node $$x_j$$.
     generation: int
     reachable: bool
     exit_id: Optional[str]
-    cost: float
-    path: Tuple[str, ...]
+    cost: float  # Advertised total cost $$d_j$$.
+    path: Tuple[str, ...]  # Advertised ordered movement-node sequence $$P_j$$.
 
     @classmethod
     def withdrawal(cls, sender_device: str, sender_node: str, generation: int) -> "RouteAdvertisement":
-        """Build an explicit unreachable-route advertisement."""
+        r"""Advertise $$d_j=\infty$$ when no valid exit route is known."""
         return cls(sender_device, sender_node, generation, False, None, INF, tuple())
 
 
 @dataclass
 class RouteAgentState:
-    """Mutable local state owned by one path-vector device agent."""
+    r"""Mutable local state owned by device $$i$$ controlling $$x_i$$."""
     device_name: str
     controlled_node: str
     is_exit: bool
@@ -623,22 +647,20 @@ class RouteAgentState:
 class DistributedPathVectorEngine:
     r"""Original local path-vector routing protocol, preserved for comparison.
 
-    Each agent controls one routing waypoint x.  It knows only incident
-    physical links and route advertisements received over the radio graph.
-    An advertisement may be used as a routing candidate only when its sender
-    controls a physically adjacent waypoint, because its semantics are
-    "choose me as the first movement hop".  Remote hazard/fault dissemination
-    is instead implemented by ``DistributedLinkStateStrategy`` below.
+    Device $$i$$ builds the valid next-device candidate set
 
-    For a traversable local link (x, y), a candidate is:
+    $$\mathcal{C}_i=\{j\in\mathcal{N}^{\mathrm{comm}}_i\mid
+    (x_i,x_j)\in E_{\mathrm{move}},\ x_i\notin P_j,\ d_j<\infty\}.$$
 
-        c(x,y) + A_y.cost
+    For every $$j\in\mathcal{C}_i$$, it evaluates
 
-    where A_y is y's latest advertised route.  A candidate is rejected when x
-    already occurs in A_y.path, which prevents route loops and count-to-infinity
-    reuse after a disconnection.
+    $$d_i(j)=w(x_i,x_j)+d_j,\qquad P_i(j)=(x_i)\mathbin{|}P_j.$$
 
-    No agent stores the complete building value field or calls the diagnostic
+    The loop condition $$x_i\notin P_j$$ prevents route loops and
+    count-to-infinity reuse after a disconnection. Remote hazard/fault
+    dissemination is instead implemented by ``DistributedLinkStateStrategy``.
+
+    No device stores the complete building distance field or calls the diagnostic
     shortest-path oracle to select its displayed direction.
     """
 
@@ -648,7 +670,7 @@ class DistributedPathVectorEngine:
         communication: CommunicationEngine,
         devices: Dict[str, GuidanceDevice],
     ) -> None:
-        """Create all path-vector agents and bind them to movement/radio graphs."""
+        """Create path-vector device states bound to both graph layers."""
         self.G = movement_graph  # Deployment/config source and UI world only.
         self.communication = communication
         self.C = communication.communication_graph
@@ -675,6 +697,7 @@ class DistributedPathVectorEngine:
                 for neighbor in self.G.neighbors(node)
             }
             is_exit = self.G.nodes[node]["kind"] == "exit"
+            # Every exit device originates $$(d_i,P_i)=(0,(x_i))$$.
             route = (
                 RouteAdvertisement(device_name, node, 0, True, node, 0.0, (node,))
                 if is_exit
@@ -684,11 +707,11 @@ class DistributedPathVectorEngine:
         self._broadcast_changed_routes()
 
     def _targets(self, device_name: str) -> List[str]:
-        """Return radio neighbours that receive advertisements from a device."""
+        r"""Return $$\mathcal{N}^{\mathrm{comm}}_i$$ for device $$i$$."""
         return list(self.C.neighbors(device_name))
 
     def _broadcast_changed_routes(self) -> int:
-        """Send changed selected routes to radio neighbours."""
+        r"""Send device $$i$$'s selected $$(d_i,P_i)$$ to $$\mathcal{N}^{\mathrm{comm}}_i$$. """
         sent = 0
         for state in self.states.values():
             if not state.changed:
@@ -701,13 +724,13 @@ class DistributedPathVectorEngine:
         return sent
 
     def _process_inbox(self, state: RouteAgentState) -> None:
-        """Accept newer route advertisements from physical first-hop neighbours."""
+        r"""Retain the latest received $$(d_j,P_j)$$ from eligible first hops."""
         while state.inbox:
             advertisement = state.inbox.popleft()
             sender_node = advertisement.sender_node
-            # This is a route advertisement, not a general hazard report: its
-            # sender can be chosen only when it is a physical first hop.
-            # Link-state/fault events from arbitrary radio peers are handled by
+            # Inbox delivery already guarantees $$j\in\mathcal{N}^{\mathrm{comm}}_i$$;
+            # this check additionally requires $$(x_i,x_j)\in E_{\mathrm{move}}^0$$.
+            # Link-state/fault events from arbitrary communication peers are handled by
             # DistributedLinkStateStrategy.
             if sender_node not in state.links:
                 continue
@@ -716,11 +739,14 @@ class DistributedPathVectorEngine:
                 state.received_routes[sender_node] = advertisement
 
     def _select_route(self, state: RouteAgentState) -> RouteAdvertisement:
-        """Select the best loop-free advertised continuation for one agent."""
+        
+        r"""Select $$j_i^\star=\arg\min_{\mathrm{lex},\,j\in\mathcal{C}_i} (d_i(j),\tau(j,P_j))$$ for device $$i$$. """
+        
         if state.is_exit:
             return state.route
         candidates: List[Tuple[float, str, RouteAdvertisement]] = []
         for neighbor, link in state.links.items():
+            # These filters construct the current valid candidate set $$\mathcal{C}_i$$.
             if link.blocked:
                 continue
             advertisement = state.received_routes.get(neighbor)
@@ -730,11 +756,14 @@ class DistributedPathVectorEngine:
                 continue
             if len(set(advertisement.path)) != len(advertisement.path):
                 continue
+            # Candidate cost $$d_i(j)=w(x_i,x_j)+d_j$$.
             candidates.append((link.cost + advertisement.cost, neighbor, advertisement))
         next_generation = state.route.generation + 1
         if not candidates:
+            # $$\mathcal{C}_i=\varnothing$$: remove guidance and propagate withdrawal.
             candidate = RouteAdvertisement.withdrawal(state.device_name, state.controlled_node, next_generation)
         else:
+            # Implemented tie-break key: $$\tau(j,P_j)=x_j$$.
             cost, _, downstream = min(candidates, key=lambda item: (item[0], item[1]))
             candidate = RouteAdvertisement(
                 sender_device=state.device_name,
@@ -743,6 +772,7 @@ class DistributedPathVectorEngine:
                 reachable=True,
                 exit_id=downstream.exit_id,
                 cost=cost,
+                # $$P_i(j_i^\star)=(x_i)\mathbin{|}P_{j_i^\star}$$.
                 path=(state.controlled_node,) + downstream.path,
             )
         current_signature = (state.route.reachable, state.route.exit_id, state.route.cost, state.route.path)
@@ -750,7 +780,7 @@ class DistributedPathVectorEngine:
         return state.route if current_signature == candidate_signature else candidate
 
     def observe_incident_edge_change(self, u: str, v: str, blocked: bool, version: int) -> None:
-        """Deliver a physical observation only to the two endpoint agents."""
+        r"""Deliver a change of $$(u,v)$$ only to devices controlling its endpoints."""
         for node, neighbor in ((u, v), (v, u)):
             device_name = self.device_for_node[node]
             state = self.states[device_name]
@@ -794,7 +824,7 @@ class DistributedPathVectorEngine:
         return self.states[self.device_for_node[node]].route
 
     def next_for_node(self, node: str) -> Optional[str]:
-        """Return the first movement hop selected by the controlling device."""
+        r"""Return selected guidance next hop $$x_{j_i^\star}$$."""
         route = self.route_for_node(node)
         return route.path[1] if route.reachable and len(route.path) >= 2 else None
 
@@ -815,7 +845,7 @@ class DistributedPathVectorEngine:
 
 
 class PathVectorDiagnostics:
-    """Observer-side validation only; it never changes distributed decisions."""
+    r"""Compare advertised $$(d_i,P_i)$$ with observer-side ground truth."""
 
     def __init__(self, engine: DistributedPathVectorEngine, controller: MovementGraphController) -> None:
         """Bind observer-only path-vector diagnostics to engine and ground truth."""
@@ -824,7 +854,7 @@ class PathVectorDiagnostics:
         self.controller = controller
 
     def exact_cost(self, node: str) -> float:
-        """Return the exact ground-truth cost to the closest exit."""
+        r"""Return $$D_{\mathrm{ref}}(v)$$ for movement node $$v$$."""
         try:
             _, cost = self.controller.shortest_path_to_nearest_exit(node)
             return cost
@@ -832,7 +862,7 @@ class PathVectorDiagnostics:
             return INF
 
     def global_summary(self) -> Dict[str, float]:
-        """Compare every local path-vector route with the exact oracle route."""
+        r"""Compare every advertised $$d_i$$ with $$D_{\mathrm{ref}}(x_i)$$."""
         wrong, unsafe, max_error = 0, 0, 0.0
         for node in self.G.nodes:
             distributed = self.engine.route_for_node(node).cost
@@ -872,7 +902,7 @@ class PathVectorDiagnostics:
 
 
 class DistributedPathVectorStrategy(RoutingStrategy):
-    """Viewer-facing wrapper around local path-vector route agents."""
+    r"""Viewer-facing wrapper around local advertisements $$(d_i,P_i)$$."""
 
     def __init__(
         self,
@@ -902,7 +932,7 @@ class DistributedPathVectorStrategy(RoutingStrategy):
         self.engine.run_until_quiet(self.bootstrap_ticks)
 
     def on_edge_status_changed(self, u: str, v: str) -> None:
-        """Inject a physical edge event at its endpoint agents."""
+        r"""Inject a change of $$(u,v)$$ at devices controlling its endpoints."""
         blocked, version = self.controller.edge_event(u, v)
         self.engine.observe_incident_edge_change(u, v, blocked, version)
         self.engine.tick(self.ticks_per_event)
@@ -923,15 +953,15 @@ class DistributedPathVectorStrategy(RoutingStrategy):
         self.engine.run_until_quiet(max_ticks)
 
     def get_value(self, node: str) -> float:
-        """Return the controlling device cost for a movement node."""
+        r"""Return advertised cost $$d_i$$ for the device controlling $$x_i=node$$."""
         return self.engine.route_for_node(node).cost
 
     def get_next(self, node: str) -> Optional[str]:
-        """Return the controlling device first-hop decision."""
+        r"""Return selected guidance next hop $$x_{j_i^\star}$$."""
         return self.engine.next_for_node(node)
 
     def get_path(self, start: str) -> Tuple[List[str], float]:
-        """Return the route currently advertised by the controlling device."""
+        r"""Return $$(P_i,d_i)$$ advertised by the device controlling ``start``."""
         route = self.engine.route_for_node(start)
         if not route.reachable:
             raise nx.NetworkXNoPath(f"No distributed route from {start} to an exit.")
@@ -941,7 +971,7 @@ class DistributedPathVectorStrategy(RoutingStrategy):
         """Return uniformly sized local actuator directions.
 
         The arrow represents the selected first-hop direction, not the metric
-        length of the physical edge. Every displayed actuator therefore uses
+        length of the movement link. Every displayed actuator therefore uses
         the same normalized vector and one fixed visual scale.
         """
         arrows: List[Tuple[np.ndarray, np.ndarray]] = []
@@ -983,10 +1013,13 @@ class DistributedPathVectorStrategy(RoutingStrategy):
 # ============================================================
 # DISTRIBUTED LINK-STATE ROUTING WITH STATIC TOPOLOGY
 # ============================================================
+#
+# Device $$i$$ learns dynamic events and reconstructs a local usable graph
+# $$G_i$$ before computing distances $$D_i(v)$$ and next hops $$u_i^\star$$.
 
 @dataclass(frozen=True)
 class ComputedRoute:
-    """A locally computed physical route from one controlled waypoint."""
+    r"""Route computed in $$G_i$$ from device $$i$$'s controlled node $$x_i$$."""
 
     reachable: bool
     exit_id: Optional[str]
@@ -995,13 +1028,13 @@ class ComputedRoute:
 
     @classmethod
     def unreachable(cls) -> "ComputedRoute":
-        """Build the canonical unreachable local route."""
+        r"""Represent $$D_i(x_i)=\infty$$ and no valid guidance hop."""
         return cls(False, None, INF, tuple())
 
 
 @dataclass(frozen=True)
 class LinkStateAdvertisement:
-    """Dynamic status of one physical movement link, floodable over radio.
+    r"""Floodable movement-link event $$e=(\ell,s,\nu)$$.
 
     ``conflict`` records that two observations with the same version disagree.
     In that case the merged state is always conservative: ``blocked=True``
@@ -1009,19 +1042,20 @@ class LinkStateAdvertisement:
     """
 
     reporter_device: str
-    edge: EdgeId
-    blocked: bool
-    version: int
+    edge: EdgeId  # Link $$\ell\in E_{\mathrm{move}}^0$$.
+    blocked: bool  # State $$s\in\{\mathrm{available},\mathrm{blocked}\}$$.
+    version: int  # Monotonically increasing version $$\nu\in\mathbb{N}$$.
     conflict: bool = False
 
 
 @dataclass(frozen=True)
 class DeviceStatusAdvertisement:
-    """Dynamic availability status of one guidance device.
+    r"""Versioned availability event for one device $$j\in\mathcal{D}$$.
 
     A failed device cannot reliably announce its own failure.  In this POC the
-    event is injected at its live radio neighbours, modelling heartbeat timeout
-    detection.  Recovery is injected at the recovered device and its peers.
+    event is injected at its live communication neighbours
+    $$\mathcal{N}^{\mathrm{comm}}_j$$, modelling heartbeat timeout detection.
+    Recovery is injected at the recovered device and its peers.
     Conflicting observations at the same version resolve safety-first to
     ``failed=True`` until a newer observation is received.
     """
@@ -1035,7 +1069,7 @@ class DeviceStatusAdvertisement:
 
 @dataclass
 class LinkStateAgentState:
-    """Mutable local database and computed policy for one link-state device."""
+    r"""Device $$i$$'s event database, local graph $$G_i$$ and routing policy."""
     device_name: str
     controlled_node: str
     static_graph: nx.Graph
@@ -1052,15 +1086,14 @@ class LinkStateAgentState:
 
 
 class DistributedLinkStateEngine:
-    """Radio-flooded dynamic state plus deterministic local physical policy.
+    r"""Communication-flooded dynamic state plus deterministic local policy.
 
-    Every installed device owns a static copy of the physical movement graph.
-    Radio links carry dynamic *events*, never walking decisions: blocked or
-    reopened movement edges and failed or recovered devices.  Each live device
-    applies the events it has learned to its static topology and computes a
-    complete local value/next-hop policy.
+    Every device $$i\in\mathcal{D}$$ owns the original movement topology $$E_{\mathrm{move}}^0$$. 
+    Communication links carry dynamic events, never guidance decisions. 
+    Each live device applies its learned events, constructs
+    a local usable graph $$G_i$$ and computes distances $$D_i(v)$$ and next hops.
 
-    Policy tie-break rule, applied identically by every agent with the same
+    Policy tie-break rule, applied identically by every device with the same
     local view:
 
     1. choose minimum total movement cost to an exit;
@@ -1070,7 +1103,7 @@ class DistributedLinkStateEngine:
        physical next-hop identifier.
 
     Since all edge costs are positive, each chosen hop strictly decreases the
-    remaining value.  The policy is therefore cycle-free, and agents that have
+    remaining distance. The policy is therefore cycle-free, and devices that have
     learned the same events compute suffix-consistent arrows even in ties.
 
     ``self.G`` and ``CommunicationEngine`` remain observer/environment truth
@@ -1084,7 +1117,7 @@ class DistributedLinkStateEngine:
         communication: CommunicationEngine,
         devices: Dict[str, GuidanceDevice],
     ) -> None:
-        """Create link-state agents with static topology and dynamic databases."""
+        """Create link-state device states with static topology and event databases."""
         self.G = movement_graph
         self.communication = communication
         self.C = communication.communication_graph
@@ -1098,7 +1131,7 @@ class DistributedLinkStateEngine:
         self.initialize()
 
     def _new_static_topology_copy(self) -> nx.Graph:
-        """Create the immutable physical topology copy installed on each agent."""
+        r"""Create the immutable original topology $$E_{\mathrm{move}}^0$$."""
         graph = nx.Graph()
         for node, attrs in self.G.nodes(data=True):
             graph.add_node(node, kind=attrs["kind"], label=attrs.get("label", node))
@@ -1107,11 +1140,11 @@ class DistributedLinkStateEngine:
         return nx.freeze(graph)
 
     def initialize(self) -> None:
-        """Provision devices with topology and the deployment-time baseline.
+        r"""Provision devices with $$E_{\mathrm{move}}^0$$ and baseline events.
 
         It is legitimate for all devices to know the initial all-clear state at
         installation time. Subsequent mutations are learned only through local
-        observation injection and radio dissemination.
+        observation injection and communication-graph dissemination.
         """
         self.states.clear()
         initial_links = {
@@ -1148,8 +1181,9 @@ class DistributedLinkStateEngine:
         state: LinkStateAgentState,
         event: LinkStateAdvertisement,
     ) -> Optional[LinkStateAdvertisement]:
-        """Merge one movement-link event into an agent local database."""
+        r"""Merge event $$e=(\ell,s,\nu)$$ using known version $$\nu_i(\ell)$$."""
         previous = state.known_links.get(event.edge)
+        # Standard case: apply and forward iff $$\nu>\nu_i(\ell)$$.
         if previous is None or event.version > previous.version:
             state.known_links[event.edge] = event
             if event.conflict:
@@ -1157,11 +1191,12 @@ class DistributedLinkStateEngine:
             else:
                 state.conflicting_links.discard(event.edge)
             return event
+        # Ignore stale events satisfying $$\nu<\nu_i(\ell)$$.
         if event.version < previous.version:
             return None
 
-        # Equal-version reports should agree.  Any contradiction resolves to
-        # the safer state and is itself flooded so remote agents learn it too.
+        # Extension beyond the basic version rule: contradictory events with
+        # $$\nu=\nu_i(\ell)$$ resolve to blocked and the resolution is flooded.
         conflict = previous.conflict or event.conflict or previous.blocked != event.blocked
         blocked = previous.blocked or event.blocked if conflict else previous.blocked
         if not conflict:
@@ -1184,7 +1219,7 @@ class DistributedLinkStateEngine:
         state: LinkStateAgentState,
         event: DeviceStatusAdvertisement,
     ) -> Optional[DeviceStatusAdvertisement]:
-        """Merge one device-status event into an agent local database."""
+        r"""Merge one versioned device-availability event into device $$i$$'s view."""
         previous = state.known_devices.get(event.subject_device)
         if previous is None or event.version > previous.version:
             state.known_devices[event.subject_device] = event
@@ -1221,7 +1256,7 @@ class DistributedLinkStateEngine:
         raise TypeError(f"Unsupported link-state event: {type(event)!r}")
 
     def _usable_graph_from_local_view(self, state: LinkStateAgentState) -> nx.Graph:
-        """Materialize the graph usable according to one agent local view."""
+        r"""Materialize device $$i$$'s usable local graph $$G_i$$."""
         usable = nx.Graph()
         failed_nodes = {
             self.devices[name].controlled_node
@@ -1233,12 +1268,15 @@ class DistributedLinkStateEngine:
                 usable.add_node(node, **attrs)
         for u, v, attrs in state.static_graph.edges(data=True):
             event = state.known_links[canonical_edge(u, v)]
+            # Device $$i$$ includes links it currently considers available in $$E_i$$.
             if not event.blocked and u in usable and v in usable:
                 usable.add_edge(u, v, weight=float(attrs["base_weight"]))
         return usable
 
     def _recompute_policy(self, state: LinkStateAgentState) -> ComputedRoute:
-        """Build a deterministic full policy from one agent's learned view."""
+        r"""Compute $$D_i(v)=\min_{x\in X}\operatorname{dist}_{G_i}(v,x)$$
+        and deterministic next hops for device $$i$$'s complete local view.
+        """
         usable = self._usable_graph_from_local_view(state)
         nodes = list(state.static_graph.nodes)
         values: Dict[str, float] = {node: INF for node in nodes}
@@ -1247,6 +1285,7 @@ class DistributedLinkStateEngine:
         exits = sorted(node for node, attrs in usable.nodes(data=True) if attrs["kind"] == "exit")
 
         if exits:
+            # Multi-source Dijkstra computes $$D_i(v)$$ for every reachable $$v$$.
             distances = nx.multi_source_dijkstra_path_length(usable, exits, weight="weight")
             for node, distance in distances.items():
                 values[node] = float(distance)
@@ -1262,12 +1301,14 @@ class DistributedLinkStateEngine:
                     edge_cost = float(usable[node][neighbor]["weight"])
                     if np.isinf(values[neighbor]):
                         continue
+                    # Keep only $$u$$ satisfying $$w(v,u)+D_i(u)=D_i(v)$$.
                     if not np.isclose(edge_cost + values[neighbor], values[node], rtol=0.0, atol=1e-9):
                         continue
                     downstream_exit = exit_ids[neighbor]
                     if downstream_exit is not None:
                         candidates.append((downstream_exit, neighbor))
                 if candidates:
+                    # Implemented $$\tau(u)$$ is (downstream exit identifier, $$u$$).
                     chosen_exit, chosen_next = min(candidates)
                     exit_ids[node] = chosen_exit
                     next_hops[node] = chosen_next
@@ -1278,7 +1319,7 @@ class DistributedLinkStateEngine:
         return self._route_from_policy(state, state.controlled_node)
 
     def _route_from_policy(self, state: LinkStateAgentState, start: str) -> ComputedRoute:
-        """Reconstruct this agent route from its deterministic next-hop policy."""
+        r"""Follow device $$i$$'s next-hop policy from ``start`` to its chosen exit."""
         cost = state.policy_values.get(start, INF)
         exit_id = state.policy_exits.get(start)
         if np.isinf(cost) or exit_id is None:
@@ -1300,7 +1341,7 @@ class DistributedLinkStateEngine:
         return ComputedRoute(True, exit_id, float(cost), tuple(path))
 
     def observe_incident_edge_change(self, u: str, v: str, blocked: bool, version: int) -> None:
-        """Inject a physical edge observation at live devices on its endpoints."""
+        r"""Inject $$e=((u,v),s,\nu)$$ at live devices controlling $$u$$ and $$v$$."""
         edge = canonical_edge(u, v)
         observers = [self.device_for_node[u], self.device_for_node[v]]
         for reporter in observers:
@@ -1338,7 +1379,7 @@ class DistributedLinkStateEngine:
             recovered.inbox.extend(peer_state.known_devices.values())
 
     def _broadcast(self, sender: str, events: Iterable[Any]) -> int:
-        """Flood accepted events from one live sender to live radio neighbours."""
+        r"""Flood accepted events from device $$i$$ to $$\mathcal{N}^{\mathrm{comm}}_i$$. """
         if self.communication.is_device_failed(sender):
             return 0
         sent = 0
@@ -1381,7 +1422,7 @@ class DistributedLinkStateEngine:
             self.last_messages_sent = sent
 
     def pending_work(self) -> int:
-        """Count queued events on live link-state agents."""
+        """Count queued events on live link-state devices."""
         return sum(
             len(state.inbox)
             for name, state in self.states.items()
@@ -1401,12 +1442,12 @@ class DistributedLinkStateEngine:
         return self.states[self.device_for_node[node]].route
 
     def next_for_node(self, node: str) -> Optional[str]:
-        """Return the first hop in the controlling device computed route."""
+        r"""Return $$u_i^\star$$ for the device controlling $$x_i=node$$."""
         route = self.route_for_node(node)
         return route.path[1] if route.reachable and len(route.path) >= 2 else None
 
     def route_is_locally_structurally_safe(self, node: str) -> bool:
-        """Validate a route against the owning agent local usable graph."""
+        r"""Validate a route against the owning device's local graph $$G_i$$."""
         route = self.route_for_node(node)
         if not route.reachable:
             return False
@@ -1419,7 +1460,7 @@ class DistributedLinkStateEngine:
         return all(usable.has_edge(route.path[i], route.path[i + 1]) for i in range(len(route.path) - 1))
 
     def known_conflict_counts(self) -> Tuple[int, int]:
-        """Count conservative conflict markers known by live agents."""
+        """Count conservative conflict markers known by live devices."""
         link_conflicts: Set[EdgeId] = set()
         device_conflicts: Set[str] = set()
         for device_name, state in self.states.items():
@@ -1430,11 +1471,11 @@ class DistributedLinkStateEngine:
         return len(link_conflicts), len(device_conflicts)
 
     def handoff_inconsistencies(self) -> int:
-        """Count arrows whose downstream device advertises a different suffix.
+        r"""Count selected hops whose downstream device computes a different suffix.
 
-        In a settled, connected radio graph this value must be zero because all
-        live agents have the same local view and deterministic policy. During
-        event dissemination it intentionally exposes temporary disagreement.
+        In a settled, connected communication graph this value must be zero
+        because all live devices have the same $$G_i$$ and deterministic policy.
+        During event dissemination it exposes temporary disagreement.
         """
         inconsistent = 0
         for node in self.G.nodes:
@@ -1456,7 +1497,7 @@ class DistributedLinkStateEngine:
 
 
 class LinkStateDiagnostics:
-    """Observer-only comparison against current physical/failure ground truth."""
+    r"""Observer-only comparison of each $$G_i$$ with current ground truth."""
 
     def __init__(
         self,
@@ -1471,7 +1512,7 @@ class LinkStateDiagnostics:
         self.communication = communication
 
     def _ground_truth_graph(self) -> nx.Graph:
-        """Build the actual usable movement graph from true failures and blocks."""
+        r"""Build the actual usable graph from $$E_{\mathrm{move}}$$ and failures."""
         usable = nx.Graph()
         failed_nodes = {
             device.controlled_node for name, device in self.engine.devices.items()
@@ -1486,7 +1527,7 @@ class LinkStateDiagnostics:
         return usable
 
     def exact_cost(self, node: str) -> float:
-        """Return the exact ground-truth cost from one node to any exit."""
+        r"""Return $$D_{\mathrm{ref}}(v)$$ from ground truth for node $$v$$."""
         usable = self._ground_truth_graph()
         if node not in usable:
             return INF
@@ -1513,7 +1554,7 @@ class LinkStateDiagnostics:
         )
 
     def global_summary(self) -> Dict[str, float]:
-        """Compare link-state local policies with current ground truth."""
+        r"""Compare each $$D_i(x_i)$$ and local route with ground truth."""
         wrong, unsafe, max_error = 0, 0, 0.0
         for node in self.G.nodes:
             device_name = self.engine.device_for_node[node]
@@ -1564,7 +1605,7 @@ class LinkStateDiagnostics:
 
 
 class DistributedLinkStateStrategy(RoutingStrategy):
-    """Static physical topology plus radio-flooded dynamic event strategy."""
+    r"""Static $$E_{\mathrm{move}}^0$$ plus communication-flooded event strategy."""
 
     def __init__(
         self,
@@ -1622,21 +1663,21 @@ class DistributedLinkStateStrategy(RoutingStrategy):
         self.engine.run_until_quiet(max_ticks)
 
     def get_value(self, node: str) -> float:
-        """Return the locally computed cost for a non-failed device node."""
+        r"""Return $$D_i(x_i)$$ for the live device controlling ``node``."""
         device_name = self.communication.device_for_node[node]
         if self.communication.is_device_failed(device_name):
             return INF
         return self.engine.route_for_node(node).cost
 
     def get_next(self, node: str) -> Optional[str]:
-        """Return the locally computed first hop for a non-failed device node."""
+        r"""Return $$u_i^\star$$ for the live device controlling ``node``."""
         device_name = self.communication.device_for_node[node]
         if self.communication.is_device_failed(device_name):
             return None
         return self.engine.next_for_node(node)
 
     def get_path(self, start: str) -> Tuple[List[str], float]:
-        """Return the local link-state path for a start node."""
+        r"""Return the path and $$D_i(start)$$ computed in the controlling device's $$G_i$$."""
         device_name = self.communication.device_for_node[start]
         if self.communication.is_device_failed(device_name):
             raise nx.NetworkXNoPath(f"Guidance device at {start} is failed.")
@@ -1685,7 +1726,7 @@ class DistributedLinkStateStrategy(RoutingStrategy):
 
 
 class StrategyManager:
-    """Small registry that switches and broadcasts events to routing strategies."""
+    """Small registry that switches strategies and distributes environment events."""
     def __init__(self) -> None:
         """Create an empty strategy registry."""
         self._strategies: Dict[str, RoutingStrategy] = {}
@@ -1718,7 +1759,7 @@ class StrategyManager:
         self._current = names[(index + 1) % len(names)]
 
     def notify_edge_changed(self, u: str, v: str) -> None:
-        """Broadcast one movement-edge event to all strategies."""
+        r"""Notify every strategy that link $$(u,v)$$ changed state."""
         for strategy in self._strategies.values():
             strategy.on_edge_status_changed(u, v)
 
@@ -1739,7 +1780,7 @@ class StrategyManager:
 # ============================================================
 
 class InteractiveBuildingViewer:
-    """PyVista viewer; distributed decisions remain inside the strategy."""
+    r"""PyVista viewer; decisions $$x_{j_i^\star}$$ or $$u_i^\star$$ stay local."""
 
     def __init__(
         self,
@@ -1970,7 +2011,7 @@ class InteractiveBuildingViewer:
                 self.plotter.render()
 
     def _add_static_scene(self) -> None:
-        """Render immutable geometry, graph nodes, edges and radio links."""
+        r"""Render geometry, $$V_{\mathrm{move}}$$, $$E_{\mathrm{move}}^0$$ and communication links."""
         for space in self.geometry.spaces.values():
             x, y, z = space.center
             sx, sy, sz = space.size
@@ -2035,7 +2076,7 @@ class InteractiveBuildingViewer:
         )
 
     def _draw_dynamic(self) -> None:
-        """Redraw route, cost heatmap, policy arrows and dynamic colours."""
+        r"""Redraw selected route, known costs and guidance next-hop arrows."""
         if self.path_actor is not None:
             self.plotter.remove_actor(self.path_actor)
             self.path_actor = None
@@ -2068,6 +2109,8 @@ class InteractiveBuildingViewer:
         self.policy_arrow_actors.clear()
         self.device_arrow_actors.clear()
         if self.strategy().has_global_policy():
+            # The centralized reference displays its next hop for every
+            # $$v\in V_{\mathrm{move}}$$; distributed strategies expose local arrows.
             for node in self.G.nodes:
                 nxt = self.strategy().get_next(node)
                 if nxt is not None:
@@ -2109,7 +2152,7 @@ class InteractiveBuildingViewer:
                 actor.prop.color = (0.55, 0.55, 0.55)
 
     def _recompute_path(self) -> None:
-        """Refresh the displayed route and diagnostic cost for the start node."""
+        r"""Refresh selected route cost and observer value $$D_{\mathrm{ref}}(start)$$."""
         self.current_path, self.field_cost, self.exact_cost, self.error = None, None, None, None
         try:
             self.current_path, self.field_cost = self.strategy().get_path(self.current_start)
@@ -2234,15 +2277,15 @@ class InteractiveBuildingViewer:
 # ============================================================
 
 def build_application(num_floors: int = 2) -> Tuple[BuildingGeometry, MovementGraphController, CommunicationEngine, StrategyManager]:
-    """Create the demo geometry, controllers, communication model and strategies."""
+    r"""Create $$G_{\mathrm{move}}$$, devices $$\mathcal{D}$$ and routing strategies."""
     geometry = BuildingGeometry.demo_building(num_floors=num_floors)
     controller = MovementGraphController(geometry.movement_graph)
     communication = CommunicationEngine(geometry.devices)
     communication.validate_connectivity()
     communication.validate_single_device_failure_tolerance()
-    # Required by the preserved path-vector strategy; the link-state strategy
-    # needs radio connectivity for event dissemination but does not require a
-    # direct radio edge for every physical movement edge.
+    # Path-vector requires $$j\in\mathcal{N}^{\mathrm{comm}}_i$$ for every
+    # $$(x_i,x_j)\in E_{\mathrm{move}}^0$$. Link-state requires connectivity
+    # for flooding but not direct communication across each movement link.
     communication.validate_movement_adjacency_links(geometry.movement_graph)
     manager = StrategyManager()
     manager.register("centralized-bellman-oracle", CentralizedBellmanStrategy(geometry.movement_graph))
