@@ -1,6 +1,6 @@
 # Navilight
 
-| Single-floor link failure | Two spreading fires and exit closure; two-floor rerouting. |
+| Single-floor link failure, gossip visualization | Two spreading fires and exit closure; two-floor rerouting. |
 |-------|-------|
 | <img src="assets/navilight.gif" alt="Dynamic Indoor Evacuation Guidance Simulation 1" width="360"> | <img src="assets/navilight_006.gif" alt="Dynamic Indoor Evacuation Guidance Simulation 2" width="360"> |
 
@@ -99,11 +99,11 @@ The implementation stores the original movement topology $E_{\mathrm{move}}^0$ i
 
 $$
 E_{\mathrm{move}}=
-\left\{
+\\{
 \ell\in E_{\mathrm{move}}^0
-\;\middle|\;
+\ | \
 \ell\text{ is not blocked}
-\right\}.
+\\}.
 $$
 
 ### Path-vector-style
@@ -121,14 +121,14 @@ Device $i$ can use an advertisement from $j$ only if the devices can communicate
 
 $$
 \mathcal{C}_i =
-\{
+\\{
 j \in \mathcal{N}^{\mathrm{comm}}_i
 \ | \
 (x_i,x_j)\in E_{\mathrm{move}},
 \quad x_i\notin P_j,
 \quad P_j\text{ is loop-free},
 \quad d_j<\infty
-\}
+\\}
 $$
 
 Therefore, $\mathcal{C}_i$ is the set of valid next-device candidates currently known by device $i$.
@@ -279,8 +279,9 @@ The protocol tests verify route propagation, withdrawal handling, deterministic 
 
 ## UI interactions
 
-<img src="assets/UI.png" alt="UI meaning" width="720">
-<img src="assets/fault_device.png" alt="inject fault in a device" width="720">
+| UI meaning | Inject fault in a device |
+|-------|-------|
+| <img src="assets/UI.png" alt="UI meaning" width="360"> | <img src="assets/fault_device.png" alt="Inject fault in a device" width="460"> |
 
 | Action | Effect |
 |---|---|
